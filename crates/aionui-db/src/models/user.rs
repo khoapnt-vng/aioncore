@@ -47,7 +47,10 @@ mod tests {
         let value = serde_json::to_value(&user).expect("serialize user");
         let obj = value.as_object().expect("user serializes to an object");
 
-        assert!(!obj.contains_key("password_hash"), "password_hash must not be serialized");
+        assert!(
+            !obj.contains_key("password_hash"),
+            "password_hash must not be serialized"
+        );
         assert!(!obj.contains_key("jwt_secret"), "jwt_secret must not be serialized");
         // Non-secret fields still serialize.
         assert_eq!(obj.get("id").and_then(|v| v.as_str()), Some("u1"));

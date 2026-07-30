@@ -2,6 +2,7 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use std::path::Path;
 
 const NONCE_SIZE: usize = 12;
 const KEY_SIZE: usize = 32;
@@ -32,6 +33,9 @@ pub enum CryptoError {
 
     #[error("Invalid UTF-8 in decrypted data: {0}")]
     InvalidUtf8(String),
+
+    #[error("Encryption key file error: {0}")]
+    KeyFile(String),
 }
 
 impl CryptoError {
@@ -103,12 +107,86 @@ fn validate_key_size(key: &[u8]) -> Result<(), CryptoError> {
     Ok(())
 }
 
+/// SECURITY (D-05): load the 32-byte data-encryption key from a dedicated file,
+/// creating it (cryptographically random, `0600` on Unix) on first use.
+///
+/// The key is stored in its OWN file — deliberately NOT derived from the `jwt_secret`
+/// column inside the SQLite database that holds the ciphertext. An attacker who reads
+/// only the database can no longer reconstruct the encryption key.
+///
+/// Note: this key is independent per install; it is not portable, so a database copied
+/// to another machine without this key file cannot be decrypted there.
+pub fn load_or_create_encryption_key(key_path: &Path) -> Result<[u8; KEY_SIZE], CryptoError> {
+    match std::fs::read(key_path) {
+        Ok(bytes) if bytes.len() == KEY_SIZE => {
+            let mut key = [0u8; KEY_SIZE];
+            key.copy_from_slice(&bytes);
+            Ok(key)
+        }
+        Ok(bytes) => Err(CryptoError::KeyFile(format!(
+            "key file {} has invalid length {} (expected {KEY_SIZE})",
+            key_path.display(),
+            bytes.len()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let mut key = [0u8; KEY_SIZE];
+            getrandom::getrandom(&mut key).map_err(|e| CryptoError::Random(e.to_string()))?;
+            if let Some(parent) = key_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| CryptoError::KeyFile(e.to_string()))?;
+            }
+            write_key_file(key_path, &key)?;
+            Ok(key)
+        }
+        Err(err) => Err(CryptoError::KeyFile(err.to_string())),
+    }
+}
+
+#[cfg(unix)]
+fn write_key_file(key_path: &Path, key: &[u8]) -> Result<(), CryptoError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    // create with 0600 so the key is never briefly world-readable.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(key_path)
+        .map_err(|e| CryptoError::KeyFile(e.to_string()))?;
+    file.write_all(key).map_err(|e| CryptoError::KeyFile(e.to_string()))
+}
+
+#[cfg(not(unix))]
+fn write_key_file(key_path: &Path, key: &[u8]) -> Result<(), CryptoError> {
+    // Windows: rely on the per-user profile ACL of the app data directory.
+    std::fs::write(key_path, key).map_err(|e| CryptoError::KeyFile(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn test_key() -> [u8; 32] {
         [0x42; 32]
+    }
+
+    #[test]
+    fn load_or_create_encryption_key_is_stable_and_usable() {
+        let dir = std::env::temp_dir().join(format!("aionui-enc-key-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let key_path = dir.join(".aionui-enc-key");
+
+        // First call creates the key; second call must return the identical bytes.
+        let k1 = load_or_create_encryption_key(&key_path).expect("create key");
+        let k2 = load_or_create_encryption_key(&key_path).expect("reload key");
+        assert_eq!(k1, k2, "key must be stable across reloads");
+        assert_ne!(k1, [0u8; 32], "key must not be all-zero");
+
+        // The key must round-trip through the AES layer.
+        let ciphertext = encrypt_string("secret", &k1).unwrap();
+        assert_eq!(decrypt_string(&ciphertext, &k2).unwrap(), "secret");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

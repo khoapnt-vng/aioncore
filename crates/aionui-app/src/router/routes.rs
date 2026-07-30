@@ -403,7 +403,10 @@ mod tests {
             "http://[::1]",
             "http://[::1]:9229",
         ] {
-            assert!(is_loopback_origin(&HeaderValue::from_str(allowed).unwrap()), "should allow {allowed}");
+            assert!(
+                is_loopback_origin(&HeaderValue::from_str(allowed).unwrap()),
+                "should allow {allowed}"
+            );
         }
 
         // Rejected: remote origins, the file:// null origin, look-alike hosts, non-http schemes.
@@ -416,7 +419,10 @@ mod tests {
             "file://",
             "app://local",
         ] {
-            assert!(!is_loopback_origin(&HeaderValue::from_str(denied).unwrap()), "should reject {denied}");
+            assert!(
+                !is_loopback_origin(&HeaderValue::from_str(denied).unwrap()),
+                "should reject {denied}"
+            );
         }
     }
 

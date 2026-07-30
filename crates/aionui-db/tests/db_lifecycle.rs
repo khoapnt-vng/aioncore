@@ -237,6 +237,7 @@ async fn corruption_recovery_creates_backup() {
         &path,
         DatabaseInitOptions {
             recover_corrupted_database: true,
+            encryption_key: None,
         },
     )
     .await

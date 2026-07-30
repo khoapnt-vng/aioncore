@@ -21,7 +21,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use aionui_ai_agent::{AgentRegistry, UnavailableReason};
-use aionui_db::{IAgentMetadataRepository, SqliteAgentMetadataRepository, init_database, maybe_copy_legacy_database};
+use aionui_db::{
+    DatabaseInitOptions, IAgentMetadataRepository, SqliteAgentMetadataRepository, init_database_with_options,
+    maybe_copy_legacy_database,
+};
 use aionui_runtime::{acp_tool_doctor_snapshot, doctor_snapshot};
 
 use crate::cli::Cli;
@@ -36,7 +39,19 @@ pub async fn run_doctor(cli: &Cli, merged_path: &str) -> Result<ExitCode, CliBou
     // catalog (including custom agents they've added via the UI).
     let db_path = cli.data_dir.join("aionui-backend.db");
     maybe_copy_legacy_database(&db_path).map_err(|_| doctor_database_error())?;
-    let database = init_database(&db_path).await.map_err(|_| doctor_database_error())?;
+    // SECURITY (D-06): the DB is a SQLCipher database; load the same key file used at
+    // startup (see AppConfig::encryption_key_path) so doctor can open it.
+    let encryption_key = aionui_common::load_or_create_encryption_key(&cli.data_dir.join(".aionui-enc-key"))
+        .map_err(|_| doctor_database_error())?;
+    let database = init_database_with_options(
+        &db_path,
+        DatabaseInitOptions {
+            recover_corrupted_database: false,
+            encryption_key: Some(encryption_key),
+        },
+    )
+    .await
+    .map_err(|_| doctor_database_error())?;
 
     let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(database.pool().clone()));
     let registry = AgentRegistry::new(repo);

@@ -91,8 +91,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "regis
 clap = { version = "4", features = ["derive"] }
 
 # Database
+# SECURITY (D-06): SQLCipher for at-rest encryption. sqlx-sqlite and rusqlite share a
+# single libsqlite3-sys (v0.30) in the lock file, so enabling SQLCipher here (via rusqlite's
+# bundled-sqlcipher feature) makes Cargo feature-unification build the ONE shared native
+# library with SQLCipher — so sqlx connections honour `PRAGMA key` too. Vendored OpenSSL keeps
+# the build reproducible/cross-platform without a system OpenSSL dependency.
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 
 # Auth / Crypto
 jsonwebtoken = "9"

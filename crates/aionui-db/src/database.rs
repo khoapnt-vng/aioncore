@@ -40,6 +40,10 @@ pub struct Database {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DatabaseInitOptions {
     pub recover_corrupted_database: bool,
+    /// SECURITY (D-06): when set, the SQLite file is opened as a SQLCipher database
+    /// keyed with these 32 raw bytes (`PRAGMA key = "x'<hex>'"`). `None` opens a plain
+    /// (unencrypted) database — used by in-memory/test paths.
+    pub encryption_key: Option<[u8; 32]>,
 }
 
 #[derive(Debug)]
@@ -131,7 +135,7 @@ pub async fn init_database_staged_with_options(
         })?;
     }
 
-    match try_init_file_staged(path).await {
+    match try_init_file_staged(path, options.encryption_key).await {
         Ok(db) => Ok(db),
         Err(e) if path.exists() && options.recover_corrupted_database && should_attempt_recovery(e.source()) => {
             warn!(
@@ -139,7 +143,7 @@ pub async fn init_database_staged_with_options(
                 stage = e.stage(),
                 "Authorized corrupted database backup and rebuild"
             );
-            recover_and_retry(path, e.into_source()).await
+            recover_and_retry(path, e.into_source(), options.encryption_key).await
         }
         Err(e) if path.exists() && is_recoverable_migration_corruption(e.source()) => {
             warn!(
@@ -240,7 +244,7 @@ pub fn maybe_copy_legacy_database(target: &Path) -> Result<(), DbError> {
     Ok(())
 }
 
-async fn try_init_file_staged(path: &Path) -> Result<Database, DatabaseInitError> {
+async fn try_init_file_staged(path: &Path, encryption_key: Option<[u8; 32]>) -> Result<Database, DatabaseInitError> {
     // Serialize the whole file-backed startup path, not only the sqlx
     // migrator. Opening a fresh SQLite file also runs connection-level PRAGMAs
     // such as WAL setup, which can race before migrations start.
@@ -256,9 +260,18 @@ async fn try_init_file_staged(path: &Path) -> Result<Database, DatabaseInitError
         }
     };
 
-    let opts = SqliteConnectOptions::new()
-        .filename(path)
-        .create_if_missing(true)
+    let mut opts = SqliteConnectOptions::new().filename(path).create_if_missing(true);
+    // SECURITY (D-06): key the SQLCipher database BEFORE any other pragma or access.
+    // sqlx applies the `key` pragma ahead of the rest so WAL setup runs on the
+    // decrypted database. `None` leaves the file as a plain SQLite database.
+    if let Some(key) = encryption_key {
+        let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+        // SQLCipher raw-key syntax requires the blob literal wrapped in double quotes:
+        //   PRAGMA key = "x'<hex>'";
+        // The double quotes make sqlx emit a string value rather than a bare blob token.
+        opts = opts.pragma("key", format!("\"x'{hex}'\""));
+    }
+    let opts = opts
         .foreign_keys(true)
         .busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))
         .journal_mode(SqliteJournalMode::Wal);
@@ -640,7 +653,11 @@ async fn ensure_system_user(pool: &SqlitePool) -> Result<(), DbError> {
     Ok(())
 }
 
-async fn recover_and_retry(path: &Path, original_error: DbError) -> Result<Database, DatabaseInitError> {
+async fn recover_and_retry(
+    path: &Path,
+    original_error: DbError,
+    encryption_key: Option<[u8; 32]>,
+) -> Result<Database, DatabaseInitError> {
     let backup_path = format!("{}.backup.{}", path.display(), aionui_common::now_ms());
     warn!("Backing up corrupted database to: {backup_path}");
 
@@ -654,7 +671,7 @@ async fn recover_and_retry(path: &Path, original_error: DbError) -> Result<Datab
         )
     })?;
 
-    match try_init_file_staged(path).await {
+    match try_init_file_staged(path, encryption_key).await {
         Ok(db) => {
             warn!(
                 code = "BOOTSTRAP_RECOVERED_DATABASE_CORRUPTION",

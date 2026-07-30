@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::config::{AppConfig, derive_encryption_key};
+use crate::config::AppConfig;
 use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
     RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
@@ -41,8 +41,11 @@ pub struct AppServices {
     pub agent_registry: Arc<AgentRegistry>,
     pub conversation_repo: Arc<dyn IConversationRepository>,
     pub acp_session_sync: Arc<AcpSessionSyncService>,
-    /// Raw JWT secret string, used to derive encryption keys.
+    /// Raw JWT secret string (JWT signing only).
     pub jwt_secret_raw: String,
+    /// SECURITY (D-05): 32-byte AES key loaded from a dedicated key file, independent
+    /// of the SQLite database. Shared with services that encrypt/decrypt at-rest secrets.
+    pub encryption_key: [u8; 32],
     pub data_dir: PathBuf,
     pub dump_prompts: bool,
     pub work_dir: PathBuf,
@@ -120,7 +123,10 @@ impl AppServices {
             tracing::info!("Generated and persisted new JWT secret");
         }
 
-        let encryption_key = derive_encryption_key(&secret);
+        // SECURITY (D-05): key comes from a dedicated file, NOT derived from the
+        // jwt_secret stored in the (same) SQLite database.
+        let encryption_key = aionui_common::load_or_create_encryption_key(&config.encryption_key_path())
+            .map_err(|e| anyhow::anyhow!("Failed to load data-encryption key: {e}"))?;
 
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let event_bus = Arc::new(BroadcastEventBus::new(256));
@@ -224,6 +230,7 @@ impl AppServices {
             conversation_repo,
             acp_session_sync: acp_agent_service,
             jwt_secret_raw: secret,
+            encryption_key,
             data_dir,
             dump_prompts,
             work_dir,

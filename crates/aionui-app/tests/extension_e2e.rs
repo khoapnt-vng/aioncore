@@ -5,7 +5,7 @@ use serde_json::json;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-use aionui_app::{AppConfig, AppServices, build_module_states, create_router_with_states, derive_encryption_key};
+use aionui_app::{AppConfig, AppServices, build_module_states, create_router_with_states};
 use aionui_common::{decrypt_string, now_ms};
 use aionui_db::{IChannelRepository, SqliteChannelRepository};
 use aionui_extension::{ExtensionSource, ScanPath};
@@ -691,7 +691,7 @@ async fn eq20_enable_extension_channel_persists_config_and_exposes_status() {
     assert_eq!(row.r#type, "legacy-channel");
     assert_eq!(row.status.as_deref(), Some("stopped"));
 
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = services.encryption_key;
     let decrypted = decrypt_string(&row.config, &encryption_key).unwrap();
     let config_json: serde_json::Value = serde_json::from_str(&decrypted).unwrap();
     assert_eq!(config_json["credentials"]["legacyToken"], "secret-token");

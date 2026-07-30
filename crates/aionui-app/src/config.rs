@@ -2,8 +2,6 @@
 
 use std::path::PathBuf;
 
-use sha2::{Digest, Sha256};
-
 /// Application configuration parsed from CLI arguments.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -39,6 +37,12 @@ impl AppConfig {
     pub fn database_path(&self) -> PathBuf {
         self.data_dir.join("aionui-backend.db")
     }
+
+    /// SECURITY (D-05): path to the dedicated data-encryption key file, kept SEPARATE
+    /// from the SQLite database so reading the database alone does not reveal the key.
+    pub fn encryption_key_path(&self) -> PathBuf {
+        self.data_dir.join(".aionui-enc-key")
+    }
 }
 
 impl Default for AppConfig {
@@ -54,14 +58,6 @@ impl Default for AppConfig {
             recover_corrupted_database: false,
         }
     }
-}
-
-/// Derive a 32-byte encryption key from the JWT secret using SHA-256.
-pub fn derive_encryption_key(jwt_secret: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"aionui-encryption-key:");
-    hasher.update(jwt_secret.as_bytes());
-    hasher.finalize().into()
 }
 
 #[cfg(test)]

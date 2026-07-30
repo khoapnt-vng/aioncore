@@ -96,10 +96,22 @@ pub async fn init_data_layer(config: &AppConfig) -> Result<Database, BootstrapEr
         .with_field("databasePath", db_path.display().to_string())
     })?;
     info!("Initializing database at {}", db_path.display());
+    // SECURITY (D-06): load the at-rest encryption key (D-05 key file) BEFORE opening the
+    // database so the SQLite file is opened as an encrypted SQLCipher database.
+    let encryption_key = aionui_common::load_or_create_encryption_key(&config.encryption_key_path()).map_err(|e| {
+        BootstrapError::new(
+            BootstrapErrorCode::DataInitFailed,
+            "data.encryption_key",
+            "failed to initialize application data",
+        )
+        .with_source(e)
+        .with_field("keyPath", config.encryption_key_path().display().to_string())
+    })?;
     let database = aionui_db::init_database_staged_with_options(
         &db_path,
         aionui_db::DatabaseInitOptions {
             recover_corrupted_database: config.recover_corrupted_database,
+            encryption_key: Some(encryption_key),
         },
     )
     .await

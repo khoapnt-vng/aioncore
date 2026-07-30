@@ -6,6 +6,10 @@ edition.workspace = true
 [dependencies]
 aionui-common.workspace = true
 sqlx = { workspace = true, features = ["migrate"] }
+# SECURITY (D-06): force the single shared libsqlite3-sys (links = "sqlite3") to build
+# SQLCipher, so sqlx's connections honour `PRAGMA key`. Without this direct dependency the
+# resolver leaves sqlx on plain SQLite even though rusqlite requests SQLCipher elsewhere.
+libsqlite3-sys = { version = "0.30", features = ["bundled-sqlcipher-vendored-openssl"] }
 async-trait.workspace = true
 fs2.workspace = true
 serde.workspace = true
