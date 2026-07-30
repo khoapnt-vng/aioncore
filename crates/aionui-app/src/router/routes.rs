@@ -11,7 +11,7 @@ use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Router, middleware};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use aionui_ai_agent::{agent_routes, remote_agent_routes};
 use aionui_api_types::ErrorResponse;
@@ -285,8 +285,15 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     );
 
     if services.local {
+        // SECURITY (D-01): the local API must only be reachable by the app itself, not by
+        // arbitrary web origins. This previously used `allow_origin(Any)`, which granted CORS
+        // approval to ANY origin that could reach the loopback port — including remote pages
+        // rendered inside an in-app webview — letting them read provider API keys and
+        // conversation history. Restrict CORS to loopback origins only. Same-origin requests
+        // (the WebUI static-server proxy) are unaffected because CORS does not apply to them;
+        // a non-loopback origin no longer receives an `Access-Control-Allow-Origin` header.
         let cors = CorsLayer::new()
-            .allow_origin(Any)
+            .allow_origin(AllowOrigin::predicate(|origin, _parts| is_loopback_origin(origin)))
             .allow_methods([
                 Method::GET,
                 Method::POST,
@@ -300,6 +307,28 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     } else {
         router
     }
+}
+
+/// SECURITY (D-01): returns `true` only for HTTP(S) origins whose host is a loopback
+/// address (`127.0.0.1`, `localhost`, or IPv6 `[::1]`), on any port. Used as the local-mode
+/// CORS origin predicate so arbitrary remote origins (e.g. `https://evil.example`) and the
+/// `null` origin (`file://`) are rejected while the app's own loopback renderer is allowed.
+fn is_loopback_origin(origin: &axum::http::HeaderValue) -> bool {
+    let Ok(value) = origin.to_str() else {
+        return false;
+    };
+    let Some(rest) = value.strip_prefix("http://").or_else(|| value.strip_prefix("https://")) else {
+        return false;
+    };
+    // Origins carry no path, but strip one defensively before reading the authority.
+    let authority = rest.split('/').next().unwrap_or("");
+    // IPv6 literal: `[::1]` optionally followed by `:port`.
+    if let Some(after_bracket) = authority.strip_prefix('[') {
+        return after_bracket.split(']').next() == Some("::1");
+    }
+    // `host` or `host:port`.
+    let host = authority.split(':').next().unwrap_or("");
+    host == "127.0.0.1" || host == "localhost"
 }
 
 async fn normalize_boundary_error_response(request: Request, next: Next) -> Response {
@@ -359,7 +388,38 @@ fn boundary_error_for_status(status: StatusCode) -> Option<(&'static str, &'stat
 mod tests {
     use axum::http::StatusCode;
 
-    use super::{boundary_error_for_status, create_router_with_runtime};
+    use super::{boundary_error_for_status, create_router_with_runtime, is_loopback_origin};
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn is_loopback_origin_allows_only_loopback_hosts() {
+        // Allowed: loopback hosts on any port, http or https, IPv4 / IPv6 / localhost.
+        for allowed in [
+            "http://127.0.0.1",
+            "http://127.0.0.1:5173",
+            "https://127.0.0.1:8443",
+            "http://localhost",
+            "http://localhost:3000",
+            "http://[::1]",
+            "http://[::1]:9229",
+        ] {
+            assert!(is_loopback_origin(&HeaderValue::from_str(allowed).unwrap()), "should allow {allowed}");
+        }
+
+        // Rejected: remote origins, the file:// null origin, look-alike hosts, non-http schemes.
+        for denied in [
+            "https://evil.example",
+            "http://attacker.com:5173",
+            "http://127.0.0.1.evil.com",
+            "http://localhost.evil.com",
+            "null",
+            "file://",
+            "app://local",
+        ] {
+            assert!(!is_loopback_origin(&HeaderValue::from_str(denied).unwrap()), "should reject {denied}");
+        }
+    }
+
     use crate::config::AppConfig;
     use crate::services::AppServices;
 
