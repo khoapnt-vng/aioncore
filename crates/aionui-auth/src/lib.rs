@@ -50,7 +50,7 @@ pub use security::security_headers_middleware;
 pub use csrf::csrf_middleware;
 
 // Auth middleware
-pub use middleware::{AuthState, CurrentUser, auth_middleware, local_auth_middleware};
+pub use middleware::{AuthState, CurrentUser, auth_middleware, constant_time_eq, local_auth_middleware};
 
 // QR token store
 pub use qr_token::QrTokenStore;

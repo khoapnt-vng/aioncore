@@ -133,7 +133,10 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     let auth_state = AuthState {
         jwt_service: state.jwt_service.clone(),
         user_repo: state.user_repo.clone(),
+        // Account-management endpoints always require a real JWT, even in local mode,
+        // so no loopback token applies here.
         local: false,
+        local_token: None,
     };
 
     // Auth rate limited routes (login, qr-login)

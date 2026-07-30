@@ -33,6 +33,55 @@ async fn test_local_mode_skips_auth() {
 }
 
 #[tokio::test]
+async fn test_local_mode_with_loopback_token_requires_token() {
+    // SECURITY (D-01): with a configured loopback token, local mode is no longer open —
+    // protected endpoints require the token, but `/health` stays reachable for liveness.
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let config = aionui_app::AppConfig {
+        local: true,
+        local_token: Some("pilot-loopback-secret".to_string()),
+        ..Default::default()
+    };
+    let services = aionui_app::AppServices::from_config(db, &config).await.unwrap();
+    let router = aionui_app::create_router(&services).await.expect("build router");
+
+    // Health check stays open (used by the desktop host to poll liveness).
+    let response = router
+        .clone()
+        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Protected endpoint WITHOUT the token → 401.
+    let response = router
+        .clone()
+        .oneshot(Request::builder().uri("/api/settings").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], "UNAUTHORIZED");
+
+    // Protected endpoint WITH the correct token → passes the auth gate (not 401/403).
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/settings")
+                .header("authorization", "Bearer pilot-loopback-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(response.status(), StatusCode::FORBIDDEN);
+
+    services.database.close().await;
+}
+
+#[tokio::test]
 async fn test_non_local_mode_requires_auth() {
     let db = aionui_db::init_database_memory().await.unwrap();
     let services = aionui_app::AppServices::from_config(db, &aionui_app::AppConfig::default())

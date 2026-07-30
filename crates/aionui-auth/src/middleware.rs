@@ -31,6 +31,32 @@ pub struct AuthState {
     pub user_repo: Arc<dyn IUserRepository>,
     /// When `true`, skip JWT verification and inject a fixed default user.
     pub local: bool,
+    /// SECURITY (D-01): per-session loopback token required for local-mode requests.
+    ///
+    /// `Some(token)` → every local-mode request must present this exact token
+    /// (constant-time compared) via `Authorization: Bearer` or the session cookie.
+    /// This closes the no-auth hole where any other local process — or a browser
+    /// CSRF drive-by against `127.0.0.1` — could act as `system_default_user`.
+    /// Sending a bearer token also forces a CORS preflight, which the loopback-only
+    /// CORS layer rejects, so cross-origin pages cannot forge authenticated calls.
+    ///
+    /// `None` → legacy open local mode. Reachable only when `AppServices` is built
+    /// directly (tests / dev); the production server refuses to start local mode
+    /// without a token (see `init_environment`).
+    pub local_token: Option<Arc<str>>,
+}
+
+/// Constant-time byte-slice equality, so validating the loopback token does not
+/// leak its contents through comparison timing. Returns `false` on length mismatch.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Authentication middleware that verifies JWT tokens and injects `CurrentUser`.
@@ -49,8 +75,19 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    // In local mode, skip JWT verification and inject a fixed default user.
+    // In local mode, skip JWT verification and inject a fixed default user — but only
+    // after proving possession of the per-session loopback token when one is configured
+    // (SECURITY D-01). Without this, any local process or browser CSRF drive-by could act
+    // as `system_default_user`.
     if state.local {
+        if let Some(expected) = &state.local_token {
+            let provided = extract_token_from_headers(request.headers())
+                .ok_or_else(|| ApiError::Unauthorized("Authentication required".into()))?;
+            if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+                tracing::debug!("local token mismatch");
+                return Err(ApiError::Unauthorized("Invalid local token".into()));
+            }
+        }
         request.extensions_mut().insert(CurrentUser {
             id: "system_default_user".to_string(),
             username: "system_default_user".to_string(),

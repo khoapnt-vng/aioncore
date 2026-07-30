@@ -11,7 +11,7 @@ use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Router, middleware};
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 
 use aionui_ai_agent::{agent_routes, remote_agent_routes};
 use aionui_api_types::ErrorResponse;
@@ -147,6 +147,8 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
         local: services.local,
+        // SECURITY (D-01): loopback token gate for local mode.
+        local_token: services.local_token.clone(),
     };
 
     // System routes protected by auth middleware
@@ -289,11 +291,14 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         // arbitrary web origins. This previously used `allow_origin(Any)`, which granted CORS
         // approval to ANY origin that could reach the loopback port — including remote pages
         // rendered inside an in-app webview — letting them read provider API keys and
-        // conversation history. Restrict CORS to loopback origins only. Same-origin requests
-        // (the WebUI static-server proxy) are unaffected because CORS does not apply to them;
-        // a non-loopback origin no longer receives an `Access-Control-Allow-Origin` header.
+        // conversation history. Restrict CORS to the app's own origins (loopback + the
+        // packaged `file://` renderer) only. Same-origin requests (the WebUI static-server
+        // proxy) are unaffected because CORS does not apply to them; a remote origin no longer
+        // receives an `Access-Control-Allow-Origin` header. Reads are additionally gated by
+        // the per-session loopback token (see `auth_middleware`), which a foreign origin
+        // cannot obtain, so CORS here is defense-in-depth rather than the primary control.
         let cors = CorsLayer::new()
-            .allow_origin(AllowOrigin::predicate(|origin, _parts| is_loopback_origin(origin)))
+            .allow_origin(AllowOrigin::predicate(|origin, _parts| is_allowed_local_origin(origin)))
             .allow_methods([
                 Method::GET,
                 Method::POST,
@@ -302,21 +307,41 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
                 Method::DELETE,
                 Method::OPTIONS,
             ])
-            .allow_headers(Any);
+            // SECURITY (D-01): mirror the requested headers rather than `*`. The loopback token
+            // rides in the `Authorization` header, and per the Fetch spec a wildcard
+            // `Access-Control-Allow-Headers` does NOT authorize `Authorization` — the preflight
+            // must echo it explicitly or every authenticated cross-origin request (dev renderer,
+            // packaged file:// renderer) fails. Mirroring also stays credential-compatible
+            // (no wildcard), so callers that send cookies still work.
+            .allow_headers(AllowHeaders::mirror_request())
+            .allow_credentials(true);
         router.layer(cors)
     } else {
         router
     }
 }
 
-/// SECURITY (D-01): returns `true` only for HTTP(S) origins whose host is a loopback
-/// address (`127.0.0.1`, `localhost`, or IPv6 `[::1]`), on any port. Used as the local-mode
-/// CORS origin predicate so arbitrary remote origins (e.g. `https://evil.example`) and the
-/// `null` origin (`file://`) are rejected while the app's own loopback renderer is allowed.
-fn is_loopback_origin(origin: &axum::http::HeaderValue) -> bool {
+/// SECURITY (D-01): CORS origin predicate for the local API — returns `true` only for the
+/// app's own origins:
+/// - loopback HTTP(S) origins (`127.0.0.1`, `localhost`, or IPv6 `[::1]`), any port — the
+///   dev renderer (Vite) and local tooling;
+/// - the opaque `null` origin and `file:` scheme — the PACKAGED renderer is loaded via
+///   `loadFile` (`file://`), whose requests carry `Origin: null`. Without allowing it the
+///   packaged app cannot read any API response and the `Authorization` preflight fails.
+///
+/// Arbitrary remote origins (e.g. `https://evil.example`) are rejected, so a page in a normal
+/// browser cannot read the API. This is defense-in-depth: the primary control is the
+/// per-session loopback token (`auth_middleware`), which a foreign origin cannot obtain — a
+/// `null`-origin context without it can still only reach unauthenticated routes.
+fn is_allowed_local_origin(origin: &axum::http::HeaderValue) -> bool {
     let Ok(value) = origin.to_str() else {
         return false;
     };
+    // The packaged renderer (file://) sends the opaque `null` origin; some contexts may send
+    // a `file:`-scheme origin. Both belong to the local app shell, not a remote web page.
+    if value == "null" || value.starts_with("file://") {
+        return true;
+    }
     let Some(rest) = value.strip_prefix("http://").or_else(|| value.strip_prefix("https://")) else {
         return false;
     };
@@ -388,12 +413,13 @@ fn boundary_error_for_status(status: StatusCode) -> Option<(&'static str, &'stat
 mod tests {
     use axum::http::StatusCode;
 
-    use super::{boundary_error_for_status, create_router_with_runtime, is_loopback_origin};
+    use super::{boundary_error_for_status, create_router_with_runtime, is_allowed_local_origin};
     use axum::http::HeaderValue;
 
     #[test]
-    fn is_loopback_origin_allows_only_loopback_hosts() {
-        // Allowed: loopback hosts on any port, http or https, IPv4 / IPv6 / localhost.
+    fn is_allowed_local_origin_allows_app_origins_only() {
+        // Allowed: loopback hosts on any port (http/https, IPv4 / IPv6 / localhost) plus the
+        // packaged renderer's opaque `null` / `file://` origin.
         for allowed in [
             "http://127.0.0.1",
             "http://127.0.0.1:5173",
@@ -402,25 +428,25 @@ mod tests {
             "http://localhost:3000",
             "http://[::1]",
             "http://[::1]:9229",
+            "null",
+            "file://",
         ] {
             assert!(
-                is_loopback_origin(&HeaderValue::from_str(allowed).unwrap()),
+                is_allowed_local_origin(&HeaderValue::from_str(allowed).unwrap()),
                 "should allow {allowed}"
             );
         }
 
-        // Rejected: remote origins, the file:// null origin, look-alike hosts, non-http schemes.
+        // Rejected: remote origins, look-alike hosts, non-loopback custom schemes.
         for denied in [
             "https://evil.example",
             "http://attacker.com:5173",
             "http://127.0.0.1.evil.com",
             "http://localhost.evil.com",
-            "null",
-            "file://",
             "app://local",
         ] {
             assert!(
-                !is_loopback_origin(&HeaderValue::from_str(denied).unwrap()),
+                !is_allowed_local_origin(&HeaderValue::from_str(denied).unwrap()),
                 "should reject {denied}"
             );
         }

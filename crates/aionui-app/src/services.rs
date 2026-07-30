@@ -51,6 +51,10 @@ pub struct AppServices {
     pub work_dir: PathBuf,
     /// When `true`, skip JWT authentication and use a fixed default user.
     pub local: bool,
+    /// SECURITY (D-01): per-session loopback token required for local-mode requests.
+    /// `Some` in production local mode (from `AIONUI_LOCAL_TOKEN`); `None` only for
+    /// tests / dev that construct services directly.
+    pub local_token: Option<Arc<str>>,
     pub app_version: String,
     /// Resolved skill paths. Shared with the `ConversationService` for
     /// snapshot resolution at create time.
@@ -96,6 +100,7 @@ impl AppServices {
         let data_dir = config.data_dir.clone();
         let work_dir = config.work_dir.clone();
         let local = config.local;
+        let local_token: Option<Arc<str>> = config.local_token.as_deref().map(Arc::from);
         let dump_prompts = config.dump_prompts;
         let app_version = config.app_version.clone();
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
@@ -235,6 +240,7 @@ impl AppServices {
             dump_prompts,
             work_dir,
             local,
+            local_token,
             app_version,
             skill_paths,
             skill_repo,

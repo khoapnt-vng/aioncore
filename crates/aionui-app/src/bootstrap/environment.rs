@@ -14,6 +14,11 @@ use super::tracing_init::{LogGuards, init_tracing};
 use super::work_dir::resolve_work_dir;
 use super::{BootstrapError, BootstrapErrorCode};
 
+/// Env var carrying the per-session loopback auth token (SECURITY D-01). The desktop
+/// host (Electron / WePrompt backend launcher) generates a fresh random token each run
+/// and passes it here at spawn time; the same value must be sent by every API/WS client.
+const LOCAL_TOKEN_ENV: &str = "AIONUI_LOCAL_TOKEN";
+
 /// Resolved environment needed by all non-MCP subcommands.
 pub struct ServerEnvironment {
     /// Must be held alive for the process lifetime to flush log buffers.
@@ -42,6 +47,19 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         std::env::set_var("AIONUI_WORK_DIR", &work_dir);
     }
 
+    // SECURITY (D-01): the embedded local API is protected by a per-session loopback
+    // token supplied by the desktop host via the `AIONUI_LOCAL_TOKEN` env var. In local
+    // mode this token is MANDATORY — refuse to start without it rather than silently
+    // reverting to an unauthenticated API that any local process could drive.
+    let local_token = std::env::var(LOCAL_TOKEN_ENV).ok().filter(|s| !s.is_empty());
+    if cli.local && local_token.is_none() {
+        return Err(BootstrapError::new(
+            BootstrapErrorCode::ConfigInvalid,
+            "config.local_token",
+            "local mode requires a loopback auth token but AIONUI_LOCAL_TOKEN is unset or empty",
+        ));
+    }
+
     let config = AppConfig {
         host: cli.host.clone(),
         port: cli.port,
@@ -49,13 +67,15 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         work_dir,
         app_version: cli.app_version.clone(),
         local: cli.local,
+        local_token,
         dump_prompts: cli.dump_prompts,
         recover_corrupted_database: cli.recover_corrupted_database,
     };
     info!(
         "Running in {} mode — authentication is {}",
         if config.local { "local" } else { "remote" },
-        if config.local { "disabled" } else { "enabled" }
+        // Local mode is no longer unauthenticated: it is gated by the loopback token.
+        if config.local { "loopback-token" } else { "enabled" }
     );
 
     Ok(ServerEnvironment {

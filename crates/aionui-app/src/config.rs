@@ -12,6 +12,10 @@ pub struct AppConfig {
     pub app_version: String,
     /// Run in local embedded mode (skip authentication, use system_default_user).
     pub local: bool,
+    /// SECURITY (D-01): per-session loopback token required for local-mode API/WS
+    /// requests. Populated from the `AIONUI_LOCAL_TOKEN` env var at startup. When
+    /// `local` is set, the server refuses to start without it (see `init_environment`).
+    pub local_token: Option<String>,
     /// Dump prompt diagnostics under `data_dir/prompt-dumps`.
     pub dump_prompts: bool,
     /// Explicitly authorize backup and rebuild for corruption-like local databases.
@@ -54,6 +58,7 @@ impl Default for AppConfig {
             work_dir: PathBuf::from("data"),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             local: false,
+            local_token: None,
             dump_prompts: false,
             recover_corrupted_database: false,
         }

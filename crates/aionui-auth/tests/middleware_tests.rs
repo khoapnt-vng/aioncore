@@ -135,6 +135,7 @@ fn protected_auth_app(jwt_service: Arc<JwtService>, user_repo: Arc<dyn IUserRepo
         jwt_service,
         user_repo,
         local: false,
+        local_token: None,
     };
 
     Router::new()
@@ -487,4 +488,104 @@ fn t13_2_cookie_fallback() {
 fn t13_3_no_token_returns_none() {
     let headers = axum::http::HeaderMap::new();
     assert_eq!(aionui_auth::extract_token_from_headers(&headers), None);
+}
+
+// ============================================================
+// D-01 — local-mode loopback token gate
+//
+// In local (embedded) mode the API previously injected `system_default_user`
+// unconditionally, so any local process or browser CSRF drive-by could act as
+// that user. With a configured loopback token, local-mode requests must present
+// it (via `Authorization: Bearer` or the session cookie) or be rejected 401.
+// ============================================================
+
+async fn local_protected_app(local_token: Option<&str>) -> Router {
+    let db = init_database_memory().await.unwrap();
+    let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let state = AuthState {
+        jwt_service: Arc::new(JwtService::new("local_test_secret".into())),
+        user_repo,
+        local: true,
+        local_token: local_token.map(Arc::from),
+    };
+    Router::new()
+        .route("/protected", get(|| async { "ok" }))
+        .route_layer(middleware::from_fn_with_state(state, auth_middleware))
+}
+
+#[tokio::test]
+async fn d01_local_mode_rejects_missing_loopback_token() {
+    let app = local_protected_app(Some("s3cr3t-loopback-token")).await;
+    let resp = app
+        .oneshot(Request::get("/protected").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(resp).await["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn d01_local_mode_rejects_wrong_loopback_token() {
+    let app = local_protected_app(Some("s3cr3t-loopback-token")).await;
+    let resp = app
+        .oneshot(
+            Request::get("/protected")
+                .header(header::AUTHORIZATION, "Bearer wrong-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn d01_local_mode_accepts_correct_loopback_token_via_bearer() {
+    let app = local_protected_app(Some("s3cr3t-loopback-token")).await;
+    let resp = app
+        .oneshot(
+            Request::get("/protected")
+                .header(header::AUTHORIZATION, "Bearer s3cr3t-loopback-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn d01_local_mode_accepts_correct_loopback_token_via_cookie() {
+    let app = local_protected_app(Some("s3cr3t-loopback-token")).await;
+    let resp = app
+        .oneshot(
+            Request::get("/protected")
+                .header(header::COOKIE, "aionui-session=s3cr3t-loopback-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn d01_local_mode_without_configured_token_stays_open_for_tests() {
+    // `None` is the legacy/dev path used by tests that construct services directly;
+    // production bootstrap refuses to start local mode without a token.
+    let app = local_protected_app(None).await;
+    let resp = app
+        .oneshot(Request::get("/protected").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[test]
+fn d01_constant_time_eq_matches_only_identical_bytes() {
+    use aionui_auth::constant_time_eq;
+    assert!(constant_time_eq(b"abc", b"abc"));
+    assert!(!constant_time_eq(b"abc", b"abd"));
+    assert!(!constant_time_eq(b"abc", b"abcd")); // length mismatch
+    assert!(constant_time_eq(b"", b""));
 }

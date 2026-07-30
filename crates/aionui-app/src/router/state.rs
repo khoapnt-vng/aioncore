@@ -844,11 +844,29 @@ pub async fn build_extension_states(
 /// Build the default `WsHandlerState` from application services.
 pub fn build_ws_state(services: &AppServices) -> WsHandlerState {
     if services.local {
+        // SECURITY (D-01): gate the local WebSocket on the same per-session loopback
+        // token as the HTTP API. Browsers cannot set request headers on a WebSocket, so
+        // the token rides in `Sec-WebSocket-Protocol` (extracted by
+        // `extract_token_from_ws_headers`). Without a configured token we fall back to
+        // the legacy open behaviour (tests / dev only).
+        let (token_validator, token_extractor): (aionui_realtime::TokenValidator, aionui_realtime::TokenExtractor) =
+            match &services.local_token {
+                Some(expected) => {
+                    let expected = expected.clone();
+                    (
+                        Arc::new(move |token: &str| {
+                            aionui_auth::constant_time_eq(token.as_bytes(), expected.as_bytes())
+                        }),
+                        Arc::new(|headers: &axum::http::HeaderMap| extract_token_from_ws_headers(headers)),
+                    )
+                }
+                None => (Arc::new(|_| true), Arc::new(|_| Some("local".into()))),
+            };
         return WsHandlerState {
             manager: services.ws_manager.clone(),
             router: Arc::new(NoopMessageRouter),
-            token_validator: Arc::new(|_| true),
-            token_extractor: Arc::new(|_| Some("local".into())),
+            token_validator,
+            token_extractor,
         };
     }
 
