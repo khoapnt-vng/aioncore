@@ -9,7 +9,12 @@ name = "aioncore"
 path = "src/main.rs"
 
 [features]
-default = ["telegram", "lark", "dingtalk", "weixin"]
+# SECURITY (pilot): ship with NO external IM channel adapters by default so the build
+# cannot connect out to Telegram / Lark (Feishu) / DingTalk / WeChat Work. The generic
+# channel scaffolding remains but has no platform plugins to instantiate, so there is no
+# external IM egress surface. The feature definitions are kept so a build can still opt in
+# explicitly (e.g. `--features telegram`) if a future deployment needs one.
+default = []
 telegram = ["aionui-channel/telegram"]
 lark = ["aionui-channel/lark"]
 dingtalk = ["aionui-channel/dingtalk"]
