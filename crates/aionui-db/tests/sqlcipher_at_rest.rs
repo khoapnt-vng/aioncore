@@ -66,6 +66,64 @@ async fn encrypted_db_requires_the_correct_key() {
     assert!(correct.is_ok(), "opening with the correct key must succeed");
 }
 
+/// SECURITY (D-06 migration): a plaintext database left by a pre-encryption build
+/// must not brick startup. The encrypting backend detects the plaintext header,
+/// backs the old file up (never deletes it), and creates a fresh encrypted DB.
+#[tokio::test]
+async fn plaintext_db_is_backed_up_and_reencrypted_on_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("aionui-backend.db");
+
+    // Simulate a pre-D-06 build: a plaintext (unencrypted) database on disk.
+    {
+        let db = init_database_with_options(&db_path, opts(None)).await.unwrap();
+        db.close().await;
+    }
+    assert_eq!(
+        &std::fs::read(&db_path).unwrap()[..16],
+        b"SQLite format 3\0",
+        "precondition: the seeded database must be plaintext"
+    );
+
+    // Upgrade: the encrypting backend opens the same path with a key. Instead of
+    // failing with "file is not a database", it must migrate and start cleanly.
+    {
+        let db = init_database_with_options(&db_path, opts(Some(TEST_KEY)))
+            .await
+            .expect("encrypting backend must recover from a pre-encryption plaintext database");
+        db.close().await;
+    }
+
+    // The database at the canonical path is now encrypted...
+    assert_ne!(
+        &std::fs::read(&db_path).unwrap()[..16],
+        b"SQLite format 3\0",
+        "database must be encrypted after the plaintext migration"
+    );
+
+    // ...and the original plaintext bytes are preserved as a backup, not deleted.
+    let backups: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .contains("aionui-backend.db.plaintext-backup.")
+        })
+        .collect();
+    assert_eq!(backups.len(), 1, "exactly one plaintext backup should be kept");
+    assert_eq!(
+        &std::fs::read(backups[0].path()).unwrap()[..16],
+        b"SQLite format 3\0",
+        "the backup must be the original plaintext database"
+    );
+
+    // The migrated database opens again with the same key (durable, not just in-memory).
+    let reopen = init_database_with_options(&db_path, opts(Some(TEST_KEY))).await;
+    assert!(reopen.is_ok(), "the re-encrypted database must reopen with its key");
+}
+
 /// Guards that the sqlx-linked SQLite is actually SQLCipher. `PRAGMA cipher_version`
 /// returns a value only on SQLCipher builds; plain SQLite returns nothing. If this
 /// regresses, at-rest encryption silently degrades to plaintext.

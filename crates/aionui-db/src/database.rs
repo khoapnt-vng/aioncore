@@ -137,6 +137,21 @@ pub async fn init_database_staged_with_options(
 
     match try_init_file_staged(path, options.encryption_key).await {
         Ok(db) => Ok(db),
+        // SECURITY (D-06 migration): an encrypting backend cannot open a plaintext
+        // database left behind by a pre-encryption build. Detect that exact case by
+        // the SQLite file header and reinitialize with a fresh encrypted database,
+        // preserving the old file as a backup — instead of crashing with a confusing
+        // "file is not a database" error that surfaces to the user as a broken
+        // installation. This runs regardless of `recover_corrupted_database`: a
+        // plaintext file is unambiguously a pre-D-06 upgrade, not ambiguous corruption.
+        Err(e) if path.exists() && options.encryption_key.is_some() && is_plaintext_sqlite_file(path) => {
+            warn!(
+                code = "BOOTSTRAP_DATABASE_PLAINTEXT_REENCRYPT",
+                stage = e.stage(),
+                "Found a pre-encryption plaintext database; backing it up and creating a fresh encrypted database"
+            );
+            backup_plaintext_and_reencrypt(path, e.into_source(), options.encryption_key).await
+        }
         Err(e) if path.exists() && options.recover_corrupted_database && should_attempt_recovery(e.source()) => {
             warn!(
                 code = "BOOTSTRAP_DATABASE_CORRUPTION_REBUILD_AUTHORIZED",
@@ -685,6 +700,86 @@ async fn recover_and_retry(
             "database.recovery",
             DbError::Init(format!(
                 "Recovery failed after backup: {retry_err}. Original error: {original_error}"
+            )),
+        )),
+    }
+}
+
+/// The 16-byte magic header every plaintext SQLite 3 file begins with. A
+/// SQLCipher-encrypted database stores an encrypted (random-looking) header
+/// instead, so matching this reliably distinguishes "an unencrypted DB from a
+/// pre-D-06 build" from "our encrypted DB opened with a wrong/missing key".
+const SQLITE_PLAINTEXT_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+/// Whether `path` is a plaintext (unencrypted) SQLite database file.
+fn is_plaintext_sqlite_file(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut header = [0u8; 16];
+    match file.read_exact(&mut header) {
+        Ok(()) => &header == SQLITE_PLAINTEXT_HEADER,
+        Err(_) => false,
+    }
+}
+
+/// Append a WAL/SHM suffix to a database path (`""` returns the path unchanged).
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    if suffix.is_empty() {
+        return path.to_path_buf();
+    }
+    let mut raw = path.as_os_str().to_os_string();
+    raw.push(suffix);
+    PathBuf::from(raw)
+}
+
+/// Back up a pre-encryption plaintext database (and its `-wal`/`-shm` sidecars)
+/// next to itself, then reinitialize a fresh encrypted database at `path`.
+///
+/// The original bytes are never deleted — they are renamed to
+/// `{path}.plaintext-backup.{ts}` so an operator can migrate data out of band.
+async fn backup_plaintext_and_reencrypt(
+    path: &Path,
+    original_error: DbError,
+    encryption_key: Option<[u8; 32]>,
+) -> Result<Database, DatabaseInitError> {
+    let stamp = aionui_common::now_ms();
+    let backup_display = format!("{}.plaintext-backup.{stamp}", path.display());
+
+    // Move the main file and any WAL/SHM sidecars aside so the fresh database does
+    // not inherit a stale write-ahead log. Preserve, never delete.
+    for suffix in ["", "-wal", "-shm"] {
+        let from = sidecar_path(path, suffix);
+        if !from.exists() {
+            continue;
+        }
+        let to = format!("{backup_display}{suffix}");
+        std::fs::rename(&from, &to).map_err(|e| {
+            DatabaseInitError::new(
+                "database.plaintext_migration",
+                DbError::Init(format!(
+                    "Could not back up pre-encryption database {}: {e}. Original error: {original_error}",
+                    from.display()
+                )),
+            )
+        })?;
+    }
+
+    match try_init_file_staged(path, encryption_key).await {
+        Ok(db) => {
+            warn!(
+                code = "BOOTSTRAP_DATABASE_PLAINTEXT_REENCRYPTED",
+                stage = "database.plaintext_migration",
+                backup_path = %backup_display,
+                "Created a fresh encrypted database; the previous plaintext database was preserved as a backup"
+            );
+            Ok(db)
+        }
+        Err(retry_err) => Err(DatabaseInitError::new(
+            "database.plaintext_migration",
+            DbError::Init(format!(
+                "Reinitialization after plaintext backup failed: {retry_err}. Original error: {original_error}"
             )),
         )),
     }
