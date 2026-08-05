@@ -31,7 +31,12 @@ use protocol::{
 // Constants
 // ---------------------------------------------------------------------------
 
-const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+// A stdio MCP server launched via `npx`/`npm exec` may need to install its
+// package on first use (cold cache); 30s was too tight for that plus the MCP
+// handshake. The `npm_config_prefer_offline` env set on node-tool test spawns
+// (see `test_stdio_inner`) keeps warm runs fast, so this larger budget only
+// affects genuine first-install / slow networks.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // McpConnectionTestService
@@ -118,7 +123,14 @@ impl McpConnectionTestService {
                     Ok(resolved) => resolved,
                     Err(error) => return spawn_error_result(command, &runtime_resolution_error(&error.to_string())),
                 };
-                CmdBuilder::from_resolved(&resolved)
+                let mut builder = CmdBuilder::from_resolved(&resolved);
+                // Scoped to the connection test only (not the runtime MCP spawn):
+                // prefer the local package cache so `npx`/`npm exec` does not
+                // re-resolve the tool's dependency tree from the registry on
+                // every test, which can exceed the connection-test timeout on a
+                // cold cache / slow network. Missing packages are still fetched.
+                builder.env("npm_config_prefer_offline", "true");
+                builder
             }
             _ => {
                 let program = resolve_stdio_command(command);
