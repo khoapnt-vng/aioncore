@@ -130,6 +130,16 @@ jobs:
           if [[ -n "${RUSTFLAGS:-}" ]]; then
             echo "Using RUSTFLAGS=${RUSTFLAGS}"
           fi
+          if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
+            # openssl-src's ./Configure needs a Perl with Locale::Maketext::Simple.
+            # Under `shell: bash` the Git-for-Windows MSYS perl wins the PATH and
+            # lacks it, so point openssl-src at the runner's Strawberry Perl.
+            test -f "/c/Strawberry/perl/bin/perl.exe" || {
+              echo "::error::Strawberry Perl not found at C:/Strawberry/perl/bin/perl.exe — OpenSSL cannot be configured"
+              exit 1
+            }
+            export OPENSSL_SRC_PERL="C:/Strawberry/perl/bin/perl.exe"
+          fi
           if [[ "${{ matrix.use_cross }}" == "true" ]]; then
             cross build --release --target ${{ matrix.target }} -p aionui-app
           else
