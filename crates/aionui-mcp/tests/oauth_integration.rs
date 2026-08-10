@@ -149,8 +149,11 @@ async fn login_invalid_url_returns_error() {
     let (svc, _repo) = make_service().await;
     // This URL won't have .well-known endpoints.
     let result = svc.login("https://127.0.0.1:1").await;
-    // Should return an McpError::OAuth about discovery failure.
-    assert!(result.is_err());
+    // Discovery failure is surfaced as a structured `Ok { success: false, error }`
+    // (not a bare `Err`/500) so the UI can show what went wrong.
+    let resp = result.expect("login returns Ok with a structured failure payload");
+    assert!(!resp.success);
+    assert!(resp.error.is_some());
 }
 
 // ---------------------------------------------------------------------------

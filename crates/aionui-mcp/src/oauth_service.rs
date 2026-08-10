@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use crate::error::McpError;
+use crate::types::McpServerTransport;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -226,6 +227,39 @@ impl McpOAuthService {
         }
 
         Ok(Some(row.access_token))
+    }
+
+    /// Attach the stored OAuth `Authorization: Bearer <token>` header to an
+    /// HTTP/SSE MCP transport so the connection actually authenticates.
+    ///
+    /// `login` persists the access token, but a stored token is useless unless
+    /// every connection sends it. Without this the MCP server answers `401`,
+    /// the connection test reports `needs_auth`, and the UI re-prompts for
+    /// login immediately after a successful login — an endless login loop.
+    ///
+    /// We only inject when the transport does not already carry an explicit
+    /// `Authorization` header (a user-supplied static token such as a PAT
+    /// wins) and when a token is actually stored for the URL. Stdio transports
+    /// are left untouched.
+    pub async fn inject_authorization(&self, transport: &mut McpServerTransport) {
+        let (url, headers) = match transport {
+            McpServerTransport::Http { url, headers } | McpServerTransport::Sse { url, headers } => {
+                (url.clone(), headers)
+            }
+            McpServerTransport::Stdio { .. } => return,
+        };
+        if headers.keys().any(|k| k.eq_ignore_ascii_case("authorization")) {
+            return;
+        }
+        match self.get_token(&url).await {
+            Ok(Some(token)) => {
+                headers.insert("Authorization".to_owned(), format!("Bearer {token}"));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(server_url = %url, error = %e, "Failed to load OAuth token for MCP connection");
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -788,6 +822,77 @@ fn url_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- inject_authorization -------------------------------------------------
+
+    #[tokio::test]
+    async fn inject_authorization_adds_bearer_for_http_when_token_present() {
+        let svc = McpOAuthService::new(Arc::new(ValidTokenRepo), reqwest::Client::new());
+        let mut transport = McpServerTransport::Http {
+            url: "https://example.com".to_string(),
+            headers: std::collections::HashMap::new(),
+        };
+        svc.inject_authorization(&mut transport).await;
+        let McpServerTransport::Http { headers, .. } = &transport else {
+            panic!("expected http transport");
+        };
+        assert_eq!(headers.get("Authorization").map(String::as_str), Some("Bearer valid_access_token"));
+    }
+
+    #[tokio::test]
+    async fn inject_authorization_adds_bearer_for_sse_when_token_present() {
+        let svc = McpOAuthService::new(Arc::new(ValidTokenRepo), reqwest::Client::new());
+        let mut transport = McpServerTransport::Sse {
+            url: "https://example.com".to_string(),
+            headers: std::collections::HashMap::new(),
+        };
+        svc.inject_authorization(&mut transport).await;
+        let McpServerTransport::Sse { headers, .. } = &transport else {
+            panic!("expected sse transport");
+        };
+        assert_eq!(headers.get("Authorization").map(String::as_str), Some("Bearer valid_access_token"));
+    }
+
+    #[tokio::test]
+    async fn inject_authorization_preserves_existing_authorization_header() {
+        let svc = McpOAuthService::new(Arc::new(ValidTokenRepo), reqwest::Client::new());
+        let mut headers = std::collections::HashMap::new();
+        // Case-insensitive match: a user-supplied static PAT must not be clobbered.
+        headers.insert("authorization".to_string(), "Bearer user_pat".to_string());
+        let mut transport = McpServerTransport::Http { url: "https://example.com".to_string(), headers };
+        svc.inject_authorization(&mut transport).await;
+        let McpServerTransport::Http { headers, .. } = &transport else {
+            panic!("expected http transport");
+        };
+        assert_eq!(headers.get("authorization").map(String::as_str), Some("Bearer user_pat"));
+        assert!(!headers.contains_key("Authorization"), "must not add a second Authorization header");
+    }
+
+    #[tokio::test]
+    async fn inject_authorization_noop_when_no_token_stored() {
+        let svc = McpOAuthService::new(Arc::new(MockTokenRepo), reqwest::Client::new());
+        let mut transport = McpServerTransport::Http {
+            url: "https://example.com".to_string(),
+            headers: std::collections::HashMap::new(),
+        };
+        svc.inject_authorization(&mut transport).await;
+        let McpServerTransport::Http { headers, .. } = &transport else {
+            panic!("expected http transport");
+        };
+        assert!(headers.is_empty(), "no token stored → no header added");
+    }
+
+    #[tokio::test]
+    async fn inject_authorization_noop_for_stdio() {
+        let svc = McpOAuthService::new(Arc::new(ValidTokenRepo), reqwest::Client::new());
+        let mut transport = McpServerTransport::Stdio {
+            command: "echo".to_string(),
+            args: Vec::new(),
+            env: std::collections::HashMap::new(),
+        };
+        svc.inject_authorization(&mut transport).await;
+        assert!(matches!(transport, McpServerTransport::Stdio { .. }));
+    }
 
     // -- parse_callback_query ------------------------------------------------
 

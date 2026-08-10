@@ -166,7 +166,11 @@ async fn test_connection(
     body: Result<Json<TestMcpConnectionRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let transport = McpServerTransport::from(req.transport);
+    let mut transport = McpServerTransport::from(req.transport);
+    // Attach the stored OAuth token so the test authenticates. Without this a
+    // freshly-logged-in server still gets 401 → needs_auth, and the UI loops
+    // back to the login prompt right after a successful login.
+    state.oauth_service.inject_authorization(&mut transport).await;
     let result = state
         .connection_test_service
         .test_connection_with_runtime_scope(
