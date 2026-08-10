@@ -25,7 +25,13 @@ use crate::error::McpError;
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Default OAuth client ID for MCP servers (public client, no secret).
+///
+/// Used only when the authorization server does not support RFC 7591 Dynamic
+/// Client Registration.
 const DEFAULT_CLIENT_ID: &str = "aionui";
+
+/// Client name advertised during RFC 7591 Dynamic Client Registration.
+const DCR_CLIENT_NAME: &str = "AionUi";
 
 /// Token expiry safety margin (refresh 5 minutes before expiration).
 const EXPIRY_MARGIN_MS: i64 = 5 * 60 * 1000;
@@ -39,6 +45,22 @@ const EXPIRY_MARGIN_MS: i64 = 5 * 60 * 1000;
 struct OAuthServerMetadata {
     authorization_endpoint: String,
     token_endpoint: String,
+    /// RFC 7591 Dynamic Client Registration endpoint, when advertised.
+    #[serde(default)]
+    registration_endpoint: Option<String>,
+}
+
+/// OAuth Protected Resource Metadata (RFC 9728) — subset of fields we need.
+#[derive(Debug, Deserialize)]
+struct ProtectedResourceMetadata {
+    #[serde(default)]
+    authorization_servers: Vec<String>,
+}
+
+/// RFC 7591 Dynamic Client Registration response — subset of fields we need.
+#[derive(Debug, Deserialize)]
+struct ClientRegistrationResponse {
+    client_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -55,6 +77,9 @@ struct PendingLogin {
     auth_url: String,
     token_url: String,
     redirect_url: String,
+    /// The OAuth client ID this flow authorized with (a dynamically registered
+    /// client when the server supports RFC 7591, otherwise the default).
+    client_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,7 +126,17 @@ impl McpOAuthService {
     /// 5. Wait for the redirect with the authorization code
     /// 6. Exchange code for tokens and persist them
     pub async fn login(&self, server_url: &str) -> Result<OAuthLoginResponse, McpError> {
-        let (authorize_url, listener) = self.prepare_login_flow(server_url).await?;
+        // Surface discovery/registration failures to the caller as a structured
+        // error instead of a bare 500 so the UI can show what went wrong.
+        let (authorize_url, listener) = match self.prepare_login_flow(server_url).await {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                return Ok(OAuthLoginResponse {
+                    success: false,
+                    error: Some(e.to_string()),
+                });
+            }
+        };
 
         // Open browser.
         debug!(url = %authorize_url, "Opening browser for OAuth authorization");
@@ -204,6 +239,7 @@ impl McpOAuthService {
 
         let auth_url_str = metadata.authorization_endpoint.clone();
         let token_url_str = metadata.token_endpoint.clone();
+        let registration_endpoint = metadata.registration_endpoint.clone();
 
         let auth_url = AuthUrl::new(metadata.authorization_endpoint)
             .map_err(|e| McpError::OAuth(format!("Invalid auth URL: {e}")))?;
@@ -222,7 +258,13 @@ impl McpOAuthService {
         let redirect = RedirectUrl::new(redirect_url_str.clone())
             .map_err(|e| McpError::OAuth(format!("Invalid redirect URL: {e}")))?;
 
-        let client = BasicClient::new(ClientId::new(DEFAULT_CLIENT_ID.to_string()))
+        // Register a client dynamically (RFC 7591) when supported; servers such
+        // as Atlassian mandate this and reject the static default client ID.
+        let client_id = self
+            .resolve_client_id(registration_endpoint.as_deref(), &redirect_url_str)
+            .await?;
+
+        let client = BasicClient::new(ClientId::new(client_id.clone()))
             .set_auth_uri(auth_url)
             .set_token_uri(token_url)
             .set_redirect_uri(redirect);
@@ -242,6 +284,7 @@ impl McpOAuthService {
                 auth_url: auth_url_str,
                 token_url: token_url_str,
                 redirect_url: redirect_url_str,
+                client_id,
             });
         }
 
@@ -264,30 +307,132 @@ impl McpOAuthService {
         Ok(true)
     }
 
-    /// Discover OAuth authorization server metadata.
+    /// Discover the OAuth authorization server metadata for an MCP server.
     ///
-    /// Tries `.well-known/oauth-authorization-server` first,
-    /// falls back to `.well-known/openid-configuration`.
+    /// Follows the MCP Authorization discovery flow instead of blindly
+    /// appending `.well-known` to the full server URL:
+    /// 1. Read the `resource_metadata` pointer from the server's
+    ///    `WWW-Authenticate` challenge (RFC 9728) to locate its authorization
+    ///    server(s), falling back to the well-known protected-resource document.
+    /// 2. For each candidate issuer — and the server URL itself — probe the
+    ///    RFC 8414 (`oauth-authorization-server`) and OIDC
+    ///    (`openid-configuration`) documents at the origin root (with path
+    ///    insertion) as well as appended to the full path.
+    ///
+    /// Spec-compliant servers publish metadata at the origin root, so the old
+    /// "append to the full URL" approach failed for GitHub, Atlassian, and most
+    /// other real MCP servers.
     async fn discover_endpoints(&self, server_url: &str) -> Result<OAuthServerMetadata, McpError> {
-        let base = server_url.trim_end_matches('/');
+        let mut candidates: Vec<String> = Vec::new();
 
-        let well_known_url = format!("{base}/.well-known/oauth-authorization-server");
-        if let Ok(metadata) = self.fetch_metadata(&well_known_url).await {
-            debug!(server_url, "Discovered OAuth metadata via RFC 8414");
-            return Ok(metadata);
+        // Authorization servers advertised via RFC 9728 protected-resource metadata.
+        for issuer in self.discover_authorization_servers(server_url).await {
+            push_metadata_candidates(&mut candidates, &issuer);
         }
+        // Fall back to deriving candidates from the MCP server URL itself.
+        push_metadata_candidates(&mut candidates, server_url);
 
-        let oidc_url = format!("{base}/.well-known/openid-configuration");
-        if let Ok(metadata) = self.fetch_metadata(&oidc_url).await {
-            debug!(server_url, "Discovered OAuth metadata via OIDC");
-            return Ok(metadata);
+        for url in &candidates {
+            if let Ok(metadata) = self.fetch_metadata(url).await {
+                debug!(server_url, metadata_url = %url, "Discovered OAuth metadata");
+                return Ok(metadata);
+            }
         }
 
         Err(McpError::OAuth(format!(
-            "Failed to discover OAuth endpoints for '{server_url}': \
-             no .well-known/oauth-authorization-server or \
-             .well-known/openid-configuration found"
+            "Failed to discover OAuth endpoints for '{server_url}': no \
+             oauth-authorization-server or openid-configuration metadata found \
+             (probed {} candidate URLs)",
+            candidates.len()
         )))
+    }
+
+    /// Resolve the authorization server issuer URLs for an MCP server via
+    /// RFC 9728 protected-resource metadata.
+    ///
+    /// Best-effort: returns an empty vec when the server does not advertise
+    /// protected-resource metadata, so the caller can fall back to deriving
+    /// candidates from the server URL directly.
+    async fn discover_authorization_servers(&self, server_url: &str) -> Vec<String> {
+        let mut prm_urls: Vec<String> = Vec::new();
+
+        // Prefer the pointer from the WWW-Authenticate challenge (RFC 9728).
+        if let Ok(resp) = self.http_client.get(server_url).send().await
+            && let Some(header) = resp
+                .headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok())
+            && let Some(url) = parse_resource_metadata_pointer(header)
+        {
+            prm_urls.push(url);
+        }
+
+        // Fall back to the well-known protected-resource document at the origin.
+        if let Some(origin) = origin_of(server_url) {
+            prm_urls.push(format!("{origin}/.well-known/oauth-protected-resource"));
+        }
+
+        for prm_url in prm_urls {
+            if let Ok(resp) = self.http_client.get(&prm_url).send().await
+                && resp.status().is_success()
+                && let Ok(prm) = resp.json::<ProtectedResourceMetadata>().await
+                && !prm.authorization_servers.is_empty()
+            {
+                return prm.authorization_servers;
+            }
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve the OAuth client ID to use for a login/refresh flow.
+    ///
+    /// Registers a fresh public client via RFC 7591 Dynamic Client Registration
+    /// when the server advertises a registration endpoint; otherwise falls back
+    /// to the static default client ID.
+    async fn resolve_client_id(
+        &self,
+        registration_endpoint: Option<&str>,
+        redirect_uri: &str,
+    ) -> Result<String, McpError> {
+        match registration_endpoint {
+            Some(endpoint) => self.register_client(endpoint, redirect_uri).await,
+            None => Ok(DEFAULT_CLIENT_ID.to_string()),
+        }
+    }
+
+    /// Register a public OAuth client via RFC 7591 Dynamic Client Registration.
+    async fn register_client(&self, registration_endpoint: &str, redirect_uri: &str) -> Result<String, McpError> {
+        let body = serde_json::json!({
+            "client_name": DCR_CLIENT_NAME,
+            "redirect_uris": [redirect_uri],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+            "application_type": "native",
+        });
+
+        let resp = self
+            .http_client
+            .post(registration_endpoint)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| McpError::OAuth(format!("Client registration request failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(McpError::OAuth(format!("Client registration returned {status}: {detail}")));
+        }
+
+        let registration: ClientRegistrationResponse = resp
+            .json()
+            .await
+            .map_err(|e| McpError::OAuth(format!("Failed to parse client registration response: {e}")))?;
+
+        debug!(client_id = %registration.client_id, "Registered OAuth client via RFC 7591");
+        Ok(registration.client_id)
     }
 
     /// Fetch and parse OAuth server metadata from a URL.
@@ -379,7 +524,7 @@ impl McpOAuthService {
 
     /// Exchange the authorization code for tokens and persist them.
     async fn exchange_code(&self, server_url: &str, code: String) -> Result<(), McpError> {
-        let (auth_url_str, token_url_str, redirect_url_str, pkce_verifier) = {
+        let (auth_url_str, token_url_str, redirect_url_str, pkce_verifier, client_id) = {
             let mut guard = self.pending.lock().await;
             let pending = guard
                 .take()
@@ -389,6 +534,7 @@ impl McpOAuthService {
                 pending.token_url,
                 pending.redirect_url,
                 pending.pkce_verifier,
+                pending.client_id,
             )
         };
 
@@ -397,7 +543,8 @@ impl McpOAuthService {
         let redirect =
             RedirectUrl::new(redirect_url_str).map_err(|e| McpError::OAuth(format!("Invalid redirect URL: {e}")))?;
 
-        let client = BasicClient::new(ClientId::new(DEFAULT_CLIENT_ID.to_string()))
+        // Exchange with the same client ID the authorization was issued to.
+        let client = BasicClient::new(ClientId::new(client_id))
             .set_auth_uri(auth_url)
             .set_token_uri(token_url)
             .set_redirect_uri(redirect);
@@ -422,6 +569,11 @@ impl McpOAuthService {
         let token_url =
             TokenUrl::new(metadata.token_endpoint).map_err(|e| McpError::OAuth(format!("Invalid token URL: {e}")))?;
 
+        // NOTE: dynamically registered client IDs are not yet persisted, so
+        // refresh uses the default client ID. Public-client refresh usually
+        // succeeds on the refresh token alone; when a server binds refresh to a
+        // registered client the caller falls back to the stored token (see
+        // `get_token`). Persisting the client ID is a follow-up.
         let client = BasicClient::new(ClientId::new(DEFAULT_CLIENT_ID.to_string())).set_token_uri(token_url);
 
         let http_client = Self::build_no_redirect_client()?;
@@ -478,6 +630,80 @@ impl McpOAuthService {
     async fn clear_pending(&self) {
         let mut guard = self.pending.lock().await;
         *guard = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Discovery URL helpers
+// ---------------------------------------------------------------------------
+
+/// Return the `scheme://host[:port]` origin of a URL, or `None` if it has no
+/// recognizable scheme/host.
+fn origin_of(url: &str) -> Option<String> {
+    let scheme_end = url.find("://")?;
+    let after_scheme = scheme_end + 3;
+    let rest = &url[after_scheme..];
+    let host_len = rest.find('/').unwrap_or(rest.len());
+    if host_len == 0 {
+        return None;
+    }
+    Some(url[..after_scheme + host_len].to_string())
+}
+
+/// Return the path component of a URL with a leading `/` and no trailing `/`
+/// (e.g. `/login/oauth`), or an empty string when there is no path.
+fn path_of(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return String::new();
+    };
+    let rest = &url[scheme_end + 3..];
+    match rest.find('/') {
+        Some(idx) => rest[idx..].trim_end_matches('/').to_string(),
+        None => String::new(),
+    }
+}
+
+/// Append the ordered set of candidate OAuth metadata URLs for `base` to `out`,
+/// skipping duplicates.
+///
+/// `base` may be an authorization-server issuer or the MCP server URL. Metadata
+/// is probed at the origin root (RFC 8414, including path insertion) and OIDC,
+/// then appended to the full path (legacy behaviour) as a last resort.
+fn push_metadata_candidates(out: &mut Vec<String>, base: &str) {
+    let trimmed = base.trim_end_matches('/');
+    let mut add = |url: String| {
+        if !out.contains(&url) {
+            out.push(url);
+        }
+    };
+
+    if let Some(origin) = origin_of(trimmed) {
+        let path = path_of(trimmed);
+        // RFC 8414 with path insertion, then at the origin root.
+        add(format!("{origin}/.well-known/oauth-authorization-server{path}"));
+        add(format!("{origin}/.well-known/oauth-authorization-server"));
+        // OIDC with path insertion, then at the origin root.
+        add(format!("{origin}/.well-known/openid-configuration{path}"));
+        add(format!("{origin}/.well-known/openid-configuration"));
+    }
+
+    // Legacy: appended to the full path (the previous, spec-incorrect behaviour).
+    add(format!("{trimmed}/.well-known/openid-configuration"));
+    add(format!("{trimmed}/.well-known/oauth-authorization-server"));
+}
+
+/// Extract the `resource_metadata` URL from a `WWW-Authenticate` header value
+/// (RFC 9728), e.g. `Bearer resource_metadata="https://host/.well-known/..."`.
+fn parse_resource_metadata_pointer(header: &str) -> Option<String> {
+    const KEY: &str = "resource_metadata";
+    let idx = header.find(KEY)?;
+    let after = header[idx + KEY.len()..].trim_start();
+    let after = after.strip_prefix('=')?.trim_start();
+    if let Some(rest) = after.strip_prefix('"') {
+        rest.find('"').map(|end| rest[..end].to_string())
+    } else {
+        let end = after.find([',', ' ']).unwrap_or(after.len());
+        Some(after[..end].to_string())
     }
 }
 
@@ -641,6 +867,64 @@ mod tests {
     #[test]
     fn url_decode_mixed() {
         assert_eq!(url_decode("a%20b+c%3Dd"), "a b c=d");
+    }
+
+    // -- discovery URL helpers ----------------------------------------------
+
+    #[test]
+    fn origin_of_strips_path() {
+        assert_eq!(origin_of("https://github.com/login/oauth").unwrap(), "https://github.com");
+        assert_eq!(origin_of("https://mcp.atlassian.com/v1/sse").unwrap(), "https://mcp.atlassian.com");
+        assert_eq!(origin_of("https://host:8443/a/b").unwrap(), "https://host:8443");
+        assert_eq!(origin_of("https://github.com").unwrap(), "https://github.com");
+        assert!(origin_of("not-a-url").is_none());
+    }
+
+    #[test]
+    fn path_of_extracts_path() {
+        assert_eq!(path_of("https://github.com/login/oauth"), "/login/oauth");
+        assert_eq!(path_of("https://mcp.atlassian.com/v1/sse/"), "/v1/sse");
+        assert_eq!(path_of("https://github.com"), "");
+    }
+
+    #[test]
+    fn candidates_cover_github_issuer() {
+        // GitHub's issuer publishes RFC 8414 metadata via path insertion.
+        let mut out = Vec::new();
+        push_metadata_candidates(&mut out, "https://github.com/login/oauth");
+        assert!(out.contains(&"https://github.com/.well-known/oauth-authorization-server/login/oauth".to_string()));
+        assert!(out.contains(&"https://github.com/login/oauth/.well-known/openid-configuration".to_string()));
+    }
+
+    #[test]
+    fn candidates_cover_atlassian_root() {
+        // Atlassian publishes RFC 8414 metadata at the origin root.
+        let mut out = Vec::new();
+        push_metadata_candidates(&mut out, "https://mcp.atlassian.com/v1/sse");
+        assert!(out.contains(&"https://mcp.atlassian.com/.well-known/oauth-authorization-server".to_string()));
+    }
+
+    #[test]
+    fn candidates_are_deduplicated() {
+        let mut out = Vec::new();
+        push_metadata_candidates(&mut out, "https://github.com");
+        let len = out.len();
+        push_metadata_candidates(&mut out, "https://github.com");
+        assert_eq!(out.len(), len, "re-adding the same base must not duplicate entries");
+    }
+
+    #[test]
+    fn parse_resource_metadata_pointer_quoted() {
+        let header = r#"Bearer error="invalid_request", resource_metadata="https://api.githubcopilot.com/.well-known/oauth-protected-resource/mcp/""#;
+        assert_eq!(
+            parse_resource_metadata_pointer(header).unwrap(),
+            "https://api.githubcopilot.com/.well-known/oauth-protected-resource/mcp/"
+        );
+    }
+
+    #[test]
+    fn parse_resource_metadata_pointer_absent() {
+        assert!(parse_resource_metadata_pointer(r#"Bearer realm="OAuth", error="invalid_token""#).is_none());
     }
 
     // -- McpOAuthService construction ----------------------------------------
