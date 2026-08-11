@@ -108,6 +108,14 @@ impl McpOAuthService {
         }
     }
 
+    /// Build a service with a default HTTP client. For callers that only need
+    /// token lookup/injection ([`Self::bearer_for`]) and do not manage their
+    /// own `reqwest::Client` — e.g. the agent factory attaching stored OAuth
+    /// tokens to MCP servers at session build time.
+    pub fn with_default_client(token_repo: Arc<dyn IOAuthTokenRepository>) -> Self {
+        Self::new(token_repo, reqwest::Client::new())
+    }
+
     // -----------------------------------------------------------------------
     // Public API
     // -----------------------------------------------------------------------
@@ -251,13 +259,25 @@ impl McpOAuthService {
         if headers.keys().any(|k| k.eq_ignore_ascii_case("authorization")) {
             return;
         }
-        match self.get_token(&url).await {
-            Ok(Some(token)) => {
-                headers.insert("Authorization".to_owned(), format!("Bearer {token}"));
-            }
-            Ok(None) => {}
+        if let Some(value) = self.bearer_for(&url).await {
+            headers.insert("Authorization".to_owned(), value);
+        }
+    }
+
+    /// Return the `Authorization` header value (`"Bearer <token>"`) for
+    /// `server_url` if an OAuth token is stored, refreshing it if expired.
+    ///
+    /// Returns `None` when no token is stored or a lookup error occurs (logged).
+    /// This is the shared building block for attaching the stored token to any
+    /// MCP connection — the connection test (via [`Self::inject_authorization`])
+    /// and the ACP/native tool-use paths that build their own header types.
+    pub async fn bearer_for(&self, server_url: &str) -> Option<String> {
+        match self.get_token(server_url).await {
+            Ok(Some(token)) => Some(format!("Bearer {token}")),
+            Ok(None) => None,
             Err(e) => {
-                warn!(server_url = %url, error = %e, "Failed to load OAuth token for MCP connection");
+                warn!(server_url, error = %e, "Failed to load OAuth token for MCP connection");
+                None
             }
         }
     }

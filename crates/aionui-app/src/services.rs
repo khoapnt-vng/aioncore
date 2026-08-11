@@ -13,10 +13,10 @@ use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
-    ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    IOAuthTokenRepository, ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository,
-    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProviderRepository, SqliteSkillRepository,
-    SqliteUserRepository,
+    SqliteConversationRepository, SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProviderRepository,
+    SqliteSkillRepository, SqliteUserRepository,
 };
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 
@@ -139,6 +139,10 @@ impl AppServices {
         // so the agent gets the operator's tools (ELECTRON-1JG fix).
         let mcp_server_repo: Arc<dyn IMcpServerRepository> =
             Arc::new(SqliteMcpServerRepository::new(database.pool().clone()));
+        // Stored MCP OAuth tokens — attached as `Authorization: Bearer <token>`
+        // to HTTP/SSE MCP servers so remote servers authenticate during tool use.
+        let oauth_token_repo: Arc<dyn IOAuthTokenRepository> =
+            Arc::new(SqliteOAuthTokenRepository::new(database.pool().clone()));
 
         let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
             Arc::new(SqliteAgentMetadataRepository::new(database.pool().clone()));
@@ -188,6 +192,7 @@ impl AppServices {
             broadcaster: event_bus.clone(),
             backend_binary_path: backend_binary_path.clone(),
             mcp_server_repo: Some(mcp_server_repo),
+            oauth_token_repo: Some(oauth_token_repo),
         });
 
         // Agent factory is now wired. Future extension/custom agents

@@ -12,6 +12,7 @@ use aionui_api_types::{
 use aionui_common::ProviderWithModel;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
+use aionui_mcp::McpOAuthService;
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::ensure_runtime_command_with_reporter;
 use serde_json::{Map, Value};
@@ -68,6 +69,13 @@ pub(super) async fn build(
         deps.broadcaster.clone(),
     )
     .await;
+
+    // Attach stored OAuth tokens to HTTP/SSE MCP servers so remote servers
+    // authenticate during tool use (see the ACP factory for the rationale).
+    if let Some(oauth_repo) = deps.oauth_token_repo.as_ref() {
+        let oauth = McpOAuthService::with_default_client(oauth_repo.clone());
+        inject_oauth_headers(&mut extra_mcp_servers, &oauth, &ctx.conversation_id).await;
+    }
 
     if !extra_mcp_servers.is_empty() {
         info!(
@@ -439,6 +447,35 @@ pub(crate) fn resolve_bedrock_config(json: Option<&str>) -> Option<aion_config::
     })
 }
 
+/// Attach the stored OAuth `Authorization: Bearer <token>` header to every
+/// HTTP/SSE MCP server config that does not already carry an explicit
+/// Authorization header (a user-supplied static token, e.g. a PAT, wins).
+///
+/// The token is fixed at session-build time; a token that expires mid-session
+/// is a known limitation (long-lived-session refresh is a separate follow-up).
+async fn inject_oauth_headers(
+    servers: &mut HashMap<String, McpServerConfig>,
+    oauth: &McpOAuthService,
+    conversation_id: &str,
+) {
+    for config in servers.values_mut() {
+        if !matches!(config.transport, TransportType::StreamableHttp | TransportType::Sse) {
+            continue;
+        }
+        let Some(url) = config.url.clone() else {
+            continue;
+        };
+        let headers = config.headers.get_or_insert_with(HashMap::new);
+        if headers.keys().any(|k| k.eq_ignore_ascii_case("authorization")) {
+            continue;
+        }
+        if let Some(value) = oauth.bearer_for(&url).await {
+            headers.insert("Authorization".to_owned(), value);
+            debug!(conversation_id, url = %url, "user_mcp: attached stored OAuth bearer token (aionrs)");
+        }
+    }
+}
+
 async fn load_user_mcp_servers(
     repo: &dyn IMcpServerRepository,
     selected_ids: Option<&[String]>,
@@ -760,6 +797,93 @@ mod tests {
         mem,
         path::{Path, PathBuf},
     };
+
+    // -- inject_oauth_headers -------------------------------------------------
+
+    struct StubOAuthRepo {
+        token: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl aionui_db::IOAuthTokenRepository for StubOAuthRepo {
+        async fn get_by_url(
+            &self,
+            server_url: &str,
+        ) -> Result<Option<aionui_db::models::OAuthTokenRow>, aionui_db::DbError> {
+            Ok(self.token.as_ref().map(|t| aionui_db::models::OAuthTokenRow {
+                server_url: server_url.to_owned(),
+                access_token: t.clone(),
+                refresh_token: None,
+                token_type: "bearer".to_owned(),
+                expires_at: None,
+                created_at: 0,
+                updated_at: 0,
+            }))
+        }
+        async fn upsert(
+            &self,
+            _: aionui_db::UpsertOAuthTokenParams<'_>,
+        ) -> Result<aionui_db::models::OAuthTokenRow, aionui_db::DbError> {
+            unimplemented!()
+        }
+        async fn delete(&self, _: &str) -> Result<(), aionui_db::DbError> {
+            Ok(())
+        }
+        async fn list_authenticated_urls(&self) -> Result<Vec<String>, aionui_db::DbError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn http_config(url: &str, headers: Option<HashMap<String, String>>) -> McpServerConfig {
+        McpServerConfig {
+            transport: TransportType::StreamableHttp,
+            command: None,
+            args: None,
+            env: None,
+            url: Some(url.to_owned()),
+            headers,
+            deferred: Some(false),
+            startup_timeout_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn inject_oauth_headers_adds_bearer_for_http() {
+        let oauth = McpOAuthService::with_default_client(Arc::new(StubOAuthRepo {
+            token: Some("tok123".into()),
+        }));
+        let mut servers = HashMap::from([("jira".to_owned(), http_config("https://mcp.example.com/mcp", None))]);
+        inject_oauth_headers(&mut servers, &oauth, "conv-1").await;
+        let h = servers["jira"].headers.as_ref().expect("headers set");
+        assert_eq!(h.get("Authorization").map(String::as_str), Some("Bearer tok123"));
+    }
+
+    #[tokio::test]
+    async fn inject_oauth_headers_preserves_existing_and_skips_stdio() {
+        let oauth = McpOAuthService::with_default_client(Arc::new(StubOAuthRepo {
+            token: Some("tok123".into()),
+        }));
+        let mut pat = HashMap::new();
+        pat.insert("authorization".to_owned(), "Bearer user_pat".to_owned());
+        let mut servers = HashMap::from([
+            ("gh".to_owned(), http_config("https://api.example.com/mcp", Some(pat))),
+            ("local".to_owned(), McpServerConfig {
+                transport: TransportType::Stdio,
+                command: Some("echo".into()),
+                args: None,
+                env: None,
+                url: None,
+                headers: None,
+                deferred: Some(false),
+                startup_timeout_ms: None,
+            }),
+        ]);
+        inject_oauth_headers(&mut servers, &oauth, "conv-1").await;
+        let gh = servers["gh"].headers.as_ref().unwrap();
+        assert_eq!(gh.len(), 1, "must not add a second Authorization header");
+        assert_eq!(gh.get("authorization").map(String::as_str), Some("Bearer user_pat"));
+        assert!(servers["local"].headers.is_none(), "stdio untouched");
+    }
 
     fn path_test_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();

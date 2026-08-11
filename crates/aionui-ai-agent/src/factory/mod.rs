@@ -8,7 +8,7 @@ mod context;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aionui_db::{IMcpServerRepository, IProviderRepository};
+use aionui_db::{IMcpServerRepository, IOAuthTokenRepository, IProviderRepository};
 use aionui_realtime::EventBroadcaster;
 use futures_util::FutureExt;
 
@@ -40,6 +40,11 @@ pub struct AgentFactoryDeps {
     /// inject enabled servers into `session/new` (ELECTRON-1JG fix).
     /// `None` for tests/composition paths that do not need MCP injection.
     pub mcp_server_repo: Option<Arc<dyn IMcpServerRepository>>,
+    /// Stored MCP OAuth tokens. Used to attach `Authorization: Bearer <token>`
+    /// to HTTP/SSE MCP servers so remote servers (e.g. Atlassian) authenticate
+    /// during tool use. Without it a logged-in server still gets 401 at tool
+    /// call time. `None` for tests/paths that do not need OAuth injection.
+    pub oauth_token_repo: Option<Arc<dyn IOAuthTokenRepository>>,
 }
 
 /// Build a production agent factory that dispatches to concrete agent types.
