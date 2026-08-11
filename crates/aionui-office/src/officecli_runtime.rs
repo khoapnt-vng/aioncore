@@ -1,8 +1,7 @@
 use std::ffi::{OsStr, OsString};
-#[cfg(test)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use aionui_runtime::managed_resources::bundled_root_path;
 use aionui_runtime::resolve_command_path;
 
 // The mirror serves the same install scripts and release assets as GitHub
@@ -30,7 +29,32 @@ pub(crate) struct OfficecliInstallCommand {
 }
 
 pub(crate) fn resolve_officecli_path() -> Option<PathBuf> {
-    resolve_command_path("officecli").or_else(resolve_known_officecli_install_path)
+    resolve_command_path("officecli")
+        .or_else(resolve_bundled_officecli_path)
+        .or_else(resolve_known_officecli_install_path)
+}
+
+/// Resolve `officecli` from the app's bundled managed-resources
+/// (`<managed-resources>/office/officecli[.exe]`).
+///
+/// The desktop app ships `officecli` inside the managed-resources bundle and
+/// points `AIONUI_BUNDLED_MANAGED_RESOURCES` at that root, so the office
+/// features work out of the box without a runtime download (important on
+/// machines that block the PowerShell/curl installer). A user-provided
+/// `officecli` on `PATH` still wins, since this is only tried as a fallback.
+fn resolve_bundled_officecli_path() -> Option<PathBuf> {
+    resolve_bundled_officecli_path_from_root(bundled_root_path().as_deref())
+}
+
+fn resolve_bundled_officecli_path_from_root(root: Option<&Path>) -> Option<PathBuf> {
+    let candidate = bundled_officecli_candidate(root?);
+    candidate.is_file().then_some(candidate)
+}
+
+/// Build the expected `officecli` path inside a managed-resources root.
+fn bundled_officecli_candidate(root: &Path) -> PathBuf {
+    let exe = if cfg!(windows) { "officecli.exe" } else { "officecli" };
+    root.join("office").join(exe)
 }
 
 pub(crate) fn install_command() -> OfficecliInstallCommand {
@@ -137,6 +161,27 @@ mod tests {
     fn write_marker_file(path: &std::path::Path) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+    }
+
+    #[test]
+    fn bundled_officecli_resolves_from_managed_resources_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let candidate = bundled_officecli_candidate(tmp.path());
+        assert!(candidate.starts_with(tmp.path()));
+        assert_eq!(candidate.parent().unwrap().file_name().unwrap(), "office");
+        write_marker_file(&candidate);
+        assert_eq!(resolve_bundled_officecli_path_from_root(Some(tmp.path())), Some(candidate));
+    }
+
+    #[test]
+    fn bundled_officecli_none_when_file_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_bundled_officecli_path_from_root(Some(tmp.path())), None);
+    }
+
+    #[test]
+    fn bundled_officecli_none_when_root_missing() {
+        assert_eq!(resolve_bundled_officecli_path_from_root(None), None);
     }
 
     #[test]
