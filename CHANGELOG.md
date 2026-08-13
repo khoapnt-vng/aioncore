@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.51](https://github.com/khoapnt-vng/aioncore/compare/v0.1.50...v0.1.51) (2026-08-13)
+
+
+### Features
+
+* **office:** resolve bundled officecli from managed-resources ([5feac27](https://github.com/khoapnt-vng/aioncore/commit/5feac2780b2656aaa92a344dfc27d918af670d28))
+
+
+### Bug Fixes
+
+* **mcp:** attach stored OAuth token to MCP servers during tool use ([0bf72bd](https://github.com/khoapnt-vng/aioncore/commit/0bf72bd1e64f4bfd618d0a5434555edc052f86b5))
+* **mcp:** discover OAuth metadata per RFC 8414/9728 and support DCR ([#1](https://github.com/khoapnt-vng/aioncore/issues/1)) ([c310353](https://github.com/khoapnt-vng/aioncore/commit/c310353d4d5c0e6bffca9d8882b2cb4f4c6f82e9))
+* **mcp:** send stored OAuth token on MCP connection test ([b2c329d](https://github.com/khoapnt-vng/aioncore/commit/b2c329dd7fc7608e64280733a08453c6030322ac))
+
 ## [0.1.50](https://github.com/iOfficeAI/AionCore/compare/v0.1.49...v0.1.50) (2026-07-21)
 
 
