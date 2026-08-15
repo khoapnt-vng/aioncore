@@ -219,7 +219,7 @@ impl McpOAuthService {
         // Check if token is expired (with safety margin).
         if let Some(expires_at) = row.expires_at {
             let now = now_ms();
-            if now >= expires_at - EXPIRY_MARGIN_MS {
+            if now >= expires_at.saturating_sub(EXPIRY_MARGIN_MS) {
                 let Some(ref refresh_token) = row.refresh_token else {
                     warn!(
                         server_url,
@@ -1243,6 +1243,39 @@ mod tests {
         }
     }
 
+    struct CorruptExpiryTokenRepo;
+
+    #[async_trait::async_trait]
+    impl IOAuthTokenRepository for CorruptExpiryTokenRepo {
+        async fn get_by_url(&self, _: &str) -> Result<Option<aionui_db::models::OAuthTokenRow>, aionui_db::DbError> {
+            Ok(Some(aionui_db::models::OAuthTokenRow {
+                server_url: "https://example.com".to_string(),
+                access_token: "corrupt_expiry_token".to_string(),
+                refresh_token: None,
+                client_id: None,
+                token_type: "bearer".to_string(),
+                expires_at: Some(i64::MIN),
+                created_at: 500,
+                updated_at: 500,
+            }))
+        }
+
+        async fn upsert(
+            &self,
+            _: UpsertOAuthTokenParams<'_>,
+        ) -> Result<aionui_db::models::OAuthTokenRow, aionui_db::DbError> {
+            unimplemented!()
+        }
+
+        async fn delete(&self, _: &str) -> Result<(), aionui_db::DbError> {
+            Ok(())
+        }
+
+        async fn list_authenticated_urls(&self) -> Result<Vec<String>, aionui_db::DbError> {
+            Ok(vec![])
+        }
+    }
+
     struct NoExpiryTokenRepo;
 
     #[async_trait::async_trait]
@@ -1343,6 +1376,13 @@ mod tests {
     #[tokio::test]
     async fn get_token_requires_reauthentication_when_expired_without_refresh() {
         let svc = McpOAuthService::new(Arc::new(ExpiredTokenRepo), reqwest::Client::new());
+        let token = svc.get_token("https://example.com").await.unwrap();
+        assert_eq!(token, None);
+    }
+
+    #[tokio::test]
+    async fn get_token_fails_closed_for_extreme_expiry_timestamp() {
+        let svc = McpOAuthService::new(Arc::new(CorruptExpiryTokenRepo), reqwest::Client::new());
         let token = svc.get_token("https://example.com").await.unwrap();
         assert_eq!(token, None);
     }
