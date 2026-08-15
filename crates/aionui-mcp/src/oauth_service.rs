@@ -597,7 +597,7 @@ impl McpOAuthService {
             RedirectUrl::new(redirect_url_str).map_err(|e| McpError::OAuth(format!("Invalid redirect URL: {e}")))?;
 
         // Exchange with the same client ID the authorization was issued to.
-        let client = BasicClient::new(ClientId::new(client_id))
+        let client = BasicClient::new(ClientId::new(client_id.clone()))
             .set_auth_uri(auth_url)
             .set_token_uri(token_url)
             .set_redirect_uri(redirect);
@@ -611,7 +611,7 @@ impl McpOAuthService {
             .await
             .map_err(|e| McpError::OAuth(format!("Token exchange failed: {e}")))?;
 
-        self.persist_token(server_url, &token_result).await?;
+        self.persist_token(server_url, &token_result, &client_id).await?;
         debug!(server_url, "OAuth tokens stored successfully");
         Ok(())
     }
@@ -653,6 +653,7 @@ impl McpOAuthService {
                 server_url,
                 access_token: &new_access_token,
                 refresh_token: Some(new_refresh),
+                client_id: None,
                 token_type: "bearer",
                 expires_at,
             })
@@ -663,7 +664,12 @@ impl McpOAuthService {
     }
 
     /// Persist token response to DB.
-    async fn persist_token<TR: TokenResponse>(&self, server_url: &str, token_result: &TR) -> Result<(), McpError> {
+    async fn persist_token<TR: TokenResponse>(
+        &self,
+        server_url: &str,
+        token_result: &TR,
+        client_id: &str,
+    ) -> Result<(), McpError> {
         let expires_at: Option<TimestampMs> = token_result.expires_in().map(|d| now_ms() + d.as_millis() as i64);
 
         self.token_repo
@@ -671,6 +677,7 @@ impl McpOAuthService {
                 server_url,
                 access_token: token_result.access_token().secret(),
                 refresh_token: token_result.refresh_token().map(|t| t.secret().as_str()),
+                client_id: Some(client_id),
                 token_type: "bearer",
                 expires_at,
             })
@@ -841,6 +848,9 @@ fn url_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aionui_db::SqliteOAuthTokenRepository;
+    use oauth2::basic::{BasicTokenResponse, BasicTokenType};
+    use oauth2::{AccessToken, EmptyExtraTokenFields};
 
     // -- inject_authorization -------------------------------------------------
 
@@ -1082,6 +1092,26 @@ mod tests {
         let _clone = svc.clone();
     }
 
+    #[tokio::test]
+    async fn persist_token_stores_authorizing_client_identity() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let repo = Arc::new(SqliteOAuthTokenRepository::new(db.pool().clone()));
+        let svc = McpOAuthService::new(repo.clone(), reqwest::Client::new());
+        let mut token = BasicTokenResponse::new(
+            AccessToken::new("access-token".to_string()),
+            BasicTokenType::Bearer,
+            EmptyExtraTokenFields {},
+        );
+        token.set_refresh_token(Some(RefreshToken::new("refresh-token".to_string())));
+
+        svc.persist_token("https://dynamic.example.com", &token, "dynamic-client")
+            .await
+            .unwrap();
+
+        let stored = repo.get_by_url("https://dynamic.example.com").await.unwrap().unwrap();
+        assert_eq!(stored.client_id.as_deref(), Some("dynamic-client"));
+    }
+
     // -- Mock repositories ---------------------------------------------------
 
     struct MockTokenRepo;
@@ -1143,6 +1173,7 @@ mod tests {
                 server_url: "https://example.com".to_string(),
                 access_token: "valid_access_token".to_string(),
                 refresh_token: None,
+                client_id: None,
                 token_type: "bearer".to_string(),
                 expires_at: Some(now_ms() + 3_600_000),
                 created_at: now_ms(),
@@ -1175,6 +1206,7 @@ mod tests {
                 server_url: "https://example.com".to_string(),
                 access_token: "expired_token".to_string(),
                 refresh_token: None,
+                client_id: None,
                 token_type: "bearer".to_string(),
                 expires_at: Some(1000),
                 created_at: 500,
@@ -1207,6 +1239,7 @@ mod tests {
                 server_url: "https://example.com".to_string(),
                 access_token: "no_expiry_token".to_string(),
                 refresh_token: None,
+                client_id: None,
                 token_type: "bearer".to_string(),
                 expires_at: None,
                 created_at: now_ms(),

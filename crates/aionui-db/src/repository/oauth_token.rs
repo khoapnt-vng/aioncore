@@ -29,6 +29,7 @@ pub struct UpsertOAuthTokenParams<'a> {
     pub server_url: &'a str,
     pub access_token: &'a str,
     pub refresh_token: Option<&'a str>,
+    pub client_id: Option<&'a str>,
     pub token_type: &'a str,
     pub expires_at: Option<aionui_common::TimestampMs>,
 }

@@ -14,6 +14,11 @@ pub struct OAuthTokenRow {
     pub access_token: String,
     /// Encrypted OAuth refresh token (optional).
     pub refresh_token: Option<String>,
+    /// OAuth client identity associated with this token grant.
+    ///
+    /// Legacy rows may not have one; callers must treat that as requiring
+    /// reauthorization instead of guessing a global default.
+    pub client_id: Option<String>,
     /// Token type, typically "bearer".
     pub token_type: String,
     /// Token expiration timestamp (milliseconds).

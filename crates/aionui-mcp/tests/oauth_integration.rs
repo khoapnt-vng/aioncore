@@ -43,6 +43,7 @@ async fn check_status_authenticated_returns_true() {
         server_url: "https://mcp.example.com",
         access_token: "access_123",
         refresh_token: Some("refresh_456"),
+        client_id: None,
         token_type: "bearer",
         // Expires in the far future.
         expires_at: Some(aionui_common::now_ms() + 3_600_000),
@@ -66,6 +67,7 @@ async fn check_status_expired_token_returns_false() {
         server_url: "https://expired.example.com",
         access_token: "old_token",
         refresh_token: None,
+        client_id: None,
         token_type: "bearer",
         // Already expired.
         expires_at: Some(1000),
@@ -89,6 +91,7 @@ async fn check_status_no_expiry_treated_as_valid() {
         server_url: "https://no-expiry.example.com",
         access_token: "no_exp_token",
         refresh_token: None,
+        client_id: None,
         token_type: "bearer",
         expires_at: None,
     })
@@ -111,6 +114,7 @@ async fn get_authenticated_servers_returns_all_urls() {
         server_url: "https://a.example.com",
         access_token: "tok_a",
         refresh_token: None,
+        client_id: None,
         token_type: "bearer",
         expires_at: None,
     })
@@ -121,6 +125,7 @@ async fn get_authenticated_servers_returns_all_urls() {
         server_url: "https://b.example.com",
         access_token: "tok_b",
         refresh_token: None,
+        client_id: None,
         token_type: "bearer",
         expires_at: None,
     })
@@ -168,6 +173,7 @@ async fn logout_deletes_stored_token() {
         server_url: "https://logout.example.com",
         access_token: "to_delete",
         refresh_token: None,
+        client_id: None,
         token_type: "bearer",
         expires_at: None,
     })
@@ -216,6 +222,7 @@ async fn get_token_returns_access_token_when_valid() {
         server_url: "https://valid.example.com",
         access_token: "my_access_token",
         refresh_token: None,
+        client_id: None,
         token_type: "bearer",
         expires_at: Some(aionui_common::now_ms() + 3_600_000),
     })
@@ -234,6 +241,7 @@ async fn get_token_returns_expired_token_when_no_refresh_token() {
         server_url: "https://expired.example.com",
         access_token: "old_access",
         refresh_token: None,
+        client_id: None,
         token_type: "bearer",
         expires_at: Some(1000),
     })
@@ -253,6 +261,7 @@ async fn get_token_returns_no_expiry_token() {
         server_url: "https://noexp.example.com",
         access_token: "forever_token",
         refresh_token: None,
+        client_id: None,
         token_type: "bearer",
         expires_at: None,
     })
