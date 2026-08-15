@@ -22,6 +22,8 @@ class BundleTests(unittest.TestCase):
         (self.managed / "runtime").mkdir(parents=True)
         (self.managed / "runtime" / "tool.txt").write_bytes(b"managed-tool\n")
         (self.managed / "config.json").write_bytes(b'{"enabled":true}\n')
+        (self.managed / "office").mkdir()
+        (self.managed / "office" / "officecli").write_bytes(b"officecli-mac-arm64\n")
         self.lineage = self.root / "migration-lineage.json"
         entries = [
             {
@@ -54,6 +56,11 @@ class BundleTests(unittest.TestCase):
         self.tempdir.cleanup()
 
     def assemble(self, binary_name="aioncore", target="aarch64-apple-darwin", output_name="bundle"):
+        office_directory = self.managed / "office"
+        for name in ("officecli", "officecli.exe"):
+            (office_directory / name).unlink(missing_ok=True)
+        office_name = "officecli.exe" if "windows" in target else "officecli"
+        (office_directory / office_name).write_bytes(f"{office_name}-{target}\n".encode())
         binary = self.root / binary_name
         binary.write_bytes(b"binary-bytes\n")
         output = self.root / output_name
@@ -117,8 +124,44 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(manifest["migrationLineage"]["fingerprint"], json.loads(self.lineage.read_text())["fingerprint"])
         paths = [entry["path"] for entry in manifest["files"]]
         self.assertEqual(paths, sorted(paths))
+        self.assertIn("managed-resources/office/officecli", paths)
         self.assertNotIn("bundle-manifest.json", paths)
         self.assertNotIn("SHA256SUMS", paths)
+
+    def test_assembler_rejects_missing_or_wrong_target_officecli(self):
+        for name in ("officecli", "officecli.exe"):
+            (self.managed / "office" / name).unlink(missing_ok=True)
+        binary = self.root / "aioncore"
+        binary.write_bytes(b"binary-bytes\n")
+
+        with self.assertRaisesRegex(assemble_bundle.BundleAssemblyError, "required OfficeCLI"):
+            assemble_bundle.assemble_bundle(
+                binary=binary,
+                lineage=self.lineage,
+                managed_resources=self.managed,
+                output=self.root / "missing-officecli",
+                repository=REPOSITORY,
+                version=VERSION,
+                source_commit=SOURCE_COMMIT,
+                target="aarch64-apple-darwin",
+                built_at=BUILT_AT,
+            )
+
+        (self.managed / "office" / "officecli").write_bytes(b"wrong target")
+        windows_binary = self.root / "aioncore.exe"
+        windows_binary.write_bytes(b"binary-bytes\n")
+        with self.assertRaisesRegex(assemble_bundle.BundleAssemblyError, "required OfficeCLI"):
+            assemble_bundle.assemble_bundle(
+                binary=windows_binary,
+                lineage=self.lineage,
+                managed_resources=self.managed,
+                output=self.root / "wrong-officecli",
+                repository=REPOSITORY,
+                version=VERSION,
+                source_commit=SOURCE_COMMIT,
+                target="x86_64-pc-windows-msvc",
+                built_at=BUILT_AT,
+            )
 
     def test_manifest_and_checksum_bytes_are_deterministic_for_fixed_inputs(self):
         first = self.assemble(output_name="bundle-one")
@@ -139,6 +182,12 @@ class BundleTests(unittest.TestCase):
         (extra / "managed-resources" / "unexpected.txt").write_bytes(b"unexpected")
         with self.assertRaisesRegex(verify_bundle.BundleError, "payload inventory mismatch"):
             self.verify(extra)
+
+    def test_verifier_names_a_missing_required_officecli(self):
+        bundle = self.assemble()
+        (bundle / "managed-resources" / "office" / "officecli").unlink()
+        with self.assertRaisesRegex(verify_bundle.BundleError, "required OfficeCLI"):
+            self.verify(bundle)
 
     def test_verifier_rejects_wrong_payload_hash(self):
         bundle = self.assemble()

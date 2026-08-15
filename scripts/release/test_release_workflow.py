@@ -37,6 +37,8 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("generate-lineage.py", build)
         self.assertIn("--check migration-lineage.json", build)
         self.assertIn("prepare-managed-resources", build)
+        self.assertIn("prepare_officecli.py", build)
+        self.assertRegex(build, r"(?s)prepare_officecli\.py.*assemble_bundle\.py")
         self.assertIn("assemble_bundle.py", build)
         self.assertGreaterEqual(build.count("verify_bundle.py"), 2)
         self.assertRegex(build, r"(?s)(tar|Compress-Archive).*(tar|Expand-Archive).*verify_bundle\.py")
@@ -67,6 +69,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("bundle-manifest.json", serialized)
         self.assertIn("work/extracted/bundle-manifest.json", serialized)
         self.assertIn("build.log", serialized)
+        self.assertIn("prepare-officecli.log", serialized)
         self.assertIn("verify", serialized)
 
     def test_ci_runs_all_release_python_contract_tests(self):

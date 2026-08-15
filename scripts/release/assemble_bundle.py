@@ -63,6 +63,18 @@ def expected_binary_name(target: str) -> str:
     return "aioncore.exe" if "windows" in target else "aioncore"
 
 
+def validate_officecli(managed_resources: Path, target: str) -> None:
+    office_directory = managed_resources / "office"
+    expected_name = "officecli.exe" if "windows" in target else "officecli"
+    expected = office_directory / expected_name
+    if office_directory.is_symlink() or not office_directory.is_dir():
+        raise BundleAssemblyError(f"required OfficeCLI directory missing for target: {target}")
+    if expected.is_symlink() or not expected.is_file():
+        raise BundleAssemblyError(f"required OfficeCLI binary missing for target: {target}")
+    if {path.name for path in office_directory.iterdir()} != {expected_name}:
+        raise BundleAssemblyError(f"required OfficeCLI directory has unexpected members for target: {target}")
+
+
 def copy_managed_resources(source: Path, destination: Path) -> None:
     destination.mkdir()
     source_root = source.resolve(strict=True)
@@ -126,6 +138,7 @@ def assemble_bundle(
         raise BundleAssemblyError("lineage must be a regular file")
     if managed_resources.is_symlink() or not managed_resources.is_dir():
         raise BundleAssemblyError("managed resources must be a regular directory")
+    validate_officecli(managed_resources, target)
     if output.exists() or output.is_symlink():
         raise BundleAssemblyError(f"output already exists: {output}")
     if not output.parent.is_dir():

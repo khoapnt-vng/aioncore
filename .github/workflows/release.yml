@@ -150,6 +150,15 @@ jobs:
             --bundle-out "${PWD}/work/managed-resources" \
             2>&1 | tee evidence/prepare-managed-resources.log
 
+      - name: Add pinned OfficeCLI to managed resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release/prepare_officecli.py \
+            --managed-resources work/managed-resources \
+            --target "${{ matrix.target }}" \
+            2>&1 | tee evidence/prepare-officecli.log
+
       - name: Assemble and verify complete bundle
         shell: bash
         env:
@@ -253,6 +262,7 @@ jobs:
             work/extracted/bundle-manifest.json
             evidence/build.log
             evidence/prepare-managed-resources.log
+            evidence/prepare-officecli.log
             evidence/verify-assembled.log
             evidence/verify-extracted.log
             evidence/tool-versions.txt

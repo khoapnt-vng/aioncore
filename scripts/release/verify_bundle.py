@@ -76,6 +76,16 @@ def assert_no_symlinks(bundle: Path) -> None:
             raise BundleError(f"bundle contains symlink: {path.relative_to(bundle).as_posix()}")
 
 
+def verify_officecli(bundle: Path, target: str) -> None:
+    office_directory = bundle / "managed-resources" / "office"
+    expected_name = "officecli.exe" if "windows" in target else "officecli"
+    expected = office_directory / expected_name
+    if not office_directory.is_dir() or not expected.is_file():
+        raise BundleError(f"required OfficeCLI binary missing for target: {target}")
+    if {path.name for path in office_directory.iterdir()} != {expected_name}:
+        raise BundleError(f"required OfficeCLI directory has unexpected members for target: {target}")
+
+
 def verify_lineage(bundle: Path, manifest: dict) -> None:
     lineage = load_json(bundle / "migration-lineage.json")
     summary_fields = (
@@ -183,6 +193,7 @@ def verify_bundle(*, bundle: Path, repository: str, version: str, source_commit:
     if actual_top != expected_top or not (bundle / "managed-resources").is_dir():
         raise BundleError("bundle top-level member set mismatch")
 
+    verify_officecli(bundle, target)
     verify_lineage(bundle, manifest)
     entries = validate_manifest_files(manifest)
 
