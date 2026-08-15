@@ -94,6 +94,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
 
     def test_manual_build_uploads_a_complete_bundle_for_internal_packaging(self):
         build = self._job_script("build", workflow=self.manual)
+        self.assertIn("OPENSSL_SRC_PERL", build)
         self.assertIn("prepare-managed-resources", build)
         self.assertIn("prepare_officecli.py", build)
         self.assertIn("assemble_bundle.py", build)

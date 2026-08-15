@@ -134,6 +134,14 @@ jobs:
             echo "Using RUSTFLAGS=${RUSTFLAGS}"
           fi
 
+          if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
+            test -f "/c/Strawberry/perl/bin/perl.exe" || {
+              echo "::error::Strawberry Perl is required for the Windows OpenSSL build"
+              exit 1
+            }
+            export OPENSSL_SRC_PERL="C:/Strawberry/perl/bin/perl.exe"
+          fi
+
           if [[ "${{ matrix.use_cross }}" == "true" ]]; then
             cross build --release --target ${{ matrix.target }} -p aionui-app
           else
