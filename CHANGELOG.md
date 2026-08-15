@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.55](https://github.com/khoapnt-vng/aioncore/compare/v0.1.54...v0.1.55) (2026-08-15)
+
+### Security
+
+- **oauth:** fail closed when an expired MCP token cannot be safely refreshed and persist the issued OAuth client identity
+
+### Build System
+
+- **release:** publish complete, checksummed macOS ARM64 and Windows x64 backend bundles with deterministic migration lineage
+
 ## [0.1.50](https://github.com/iOfficeAI/AionCore/compare/v0.1.49...v0.1.50) (2026-07-21)
 
 
