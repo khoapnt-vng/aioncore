@@ -100,6 +100,12 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("verify_bundle.py", build)
         self.assertIn("work/bundle", build)
 
+    def test_internal_tag_builds_only_the_two_internal_test_targets(self):
+        self.assertIn('internal-sprint3-aioncore-*', self.manual_text)
+        self.assertIn("inputs.platform || 'internal-two-target'", self.manual_text)
+        self.assertIn('inputs.branch || github.sha', self.manual_text)
+        self.assertIn('if [ "$PLATFORM" = "internal-two-target" ]', self.manual_text)
+
     def test_workflow_has_no_force_or_overwrite_archive_path(self):
         forbidden = ["--force", "--clobber", "Compress-Archive -Force", "Remove-Item dist"]
         for token in forbidden:

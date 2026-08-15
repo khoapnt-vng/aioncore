@@ -1,6 +1,9 @@
 name: "🔨 Manual Build"
 
 on:
+  push:
+    tags:
+      - "internal-sprint3-aioncore-*"
   workflow_dispatch:
     inputs:
       branch:
@@ -47,7 +50,7 @@ jobs:
         id: set-matrix
         shell: bash
         run: |
-          PLATFORM="${{ inputs.platform }}"
+          PLATFORM="${{ inputs.platform || 'internal-two-target' }}"
 
           MACOS_ARM64='{"platform":"macos-arm64","os":"macos-latest","target":"aarch64-apple-darwin","binary_name":"aioncore","artifact_name":"aioncore-manual-macos-arm64","use_cross":false}'
           MACOS_X64='{"platform":"macos-x64","os":"macos-latest","target":"x86_64-apple-darwin","binary_name":"aioncore","artifact_name":"aioncore-manual-macos-x64","use_cross":false}'
@@ -56,7 +59,9 @@ jobs:
           LINUX_X64='{"platform":"linux-x64","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","binary_name":"aioncore","artifact_name":"aioncore-manual-linux-x64","use_cross":false}'
           LINUX_ARM64='{"platform":"linux-arm64","os":"ubuntu-latest","target":"aarch64-unknown-linux-gnu","binary_name":"aioncore","artifact_name":"aioncore-manual-linux-arm64","use_cross":true}'
 
-          if [ "$PLATFORM" = "all" ]; then
+          if [ "$PLATFORM" = "internal-two-target" ]; then
+            MATRIX="{\"include\":[$MACOS_ARM64,$WINDOWS_X64]}"
+          elif [ "$PLATFORM" = "all" ]; then
             MATRIX="{\"include\":[$MACOS_ARM64,$MACOS_X64,$WINDOWS_X64,$WINDOWS_ARM64,$LINUX_X64,$LINUX_ARM64]}"
           elif [ "$PLATFORM" = "macos-arm64" ]; then
             MATRIX="{\"include\":[$MACOS_ARM64]}"
@@ -87,7 +92,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.branch }}
+          ref: ${{ inputs.branch || github.sha }}
 
       - name: Get commit hash
         id: commit
@@ -230,6 +235,6 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Key | Value |" >> "$GITHUB_STEP_SUMMARY"
           echo "|-----|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Ref | \`${{ inputs.branch }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Ref | \`${{ inputs.branch || github.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Platforms | \`${PLATFORMS}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Artifacts | \`${ARTIFACTS}\` |" >> "$GITHUB_STEP_SUMMARY"
