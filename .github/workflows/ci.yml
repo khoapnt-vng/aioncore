@@ -20,6 +20,8 @@ jobs:
           fetch-depth: 0
       - run: bash scripts/migration/check-immutability.test.sh
       - run: bash scripts/migration/check-immutability.sh
+      - run: python3 -m unittest scripts.migration.test_generate_lineage -v
+      - run: python3 scripts/migration/generate-lineage.py --migrations crates/aionui-db/migrations --check migration-lineage.json
 
   fmt:
     name: Format
