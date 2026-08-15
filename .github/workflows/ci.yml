@@ -11,6 +11,17 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  release-contract:
+    name: Release workflow contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.3
+      - run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
+
   migration-immutability:
     name: Migration Immutability
     runs-on: ubuntu-latest
