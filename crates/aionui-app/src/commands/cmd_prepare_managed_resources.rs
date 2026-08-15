@@ -14,7 +14,8 @@ use aionui_runtime::{ensure_node_runtime, prepare_managed_acp_tool_to_root};
 const SUBCOMMAND: &str = "prepare-managed-resources";
 
 pub async fn run_prepare_managed_resources(args: PrepareManagedResourcesArgs) -> Result<ExitCode, CliBoundaryError> {
-    let output_root = args.bundle_out;
+    let output_root =
+        std::path::absolute(args.bundle_out).map_err(|_| prepare_managed_resources_error("output.resolve"))?;
     std::fs::create_dir_all(&output_root).map_err(|_| prepare_managed_resources_error("output.create"))?;
 
     let node_runtime = ensure_node_runtime()

@@ -103,12 +103,13 @@ pub async fn prepare_managed_acp_tool_to_root(
     tool: ManagedAcpToolId,
     root: &Path,
 ) -> Result<ResolvedManagedAcpTool, ManagedAcpToolError> {
+    let root = anchor_bundle_root(root)?;
     let spec = platform_spec()?;
     let node_runtime = ensure_node_runtime_with_reporter(None)
         .await
         .map_err(|error| ManagedAcpToolError::invalid(format!("prepare managed Node runtime: {error}")))?;
-    let target_root = bundle_tool_root(root, tool, spec);
-    let staging_root = bundle_prepare_staging_root(tool, spec, root);
+    let target_root = bundle_tool_root(&root, tool, spec);
+    let staging_root = bundle_prepare_staging_root(tool, spec, &root);
     if staging_root.exists() {
         let _ = fs::remove_dir_all(&staging_root);
     }
@@ -129,6 +130,16 @@ pub async fn prepare_managed_acp_tool_to_root(
     }
 
     result
+}
+
+fn anchor_bundle_root(root: &Path) -> Result<PathBuf, ManagedAcpToolError> {
+    if root.is_absolute() {
+        return Ok(root.to_path_buf());
+    }
+
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(root))
+        .map_err(ManagedAcpToolError::io)
 }
 
 fn report_failure(
@@ -1446,5 +1457,14 @@ mod tests {
                 .join(ManagedAcpToolId::CodexAcp.version())
                 .join("win32-x64")
         );
+    }
+
+    #[test]
+    fn relative_bundle_root_is_anchored_before_staging_paths_are_derived() {
+        let anchored =
+            anchor_bundle_root(Path::new("dist/release")).expect("current working directory should be available");
+
+        assert!(anchored.is_absolute());
+        assert!(anchored.ends_with("dist/release"));
     }
 }
