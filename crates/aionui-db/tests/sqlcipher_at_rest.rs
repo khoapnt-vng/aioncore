@@ -102,14 +102,15 @@ async fn plaintext_db_is_backed_up_and_reencrypted_on_upgrade() {
     );
 
     // ...and the original plaintext bytes are preserved as a backup, not deleted.
+    let backup_prefix = "aionui-backend.db.plaintext-backup.";
     let backups: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()
         .filter_map(Result::ok)
         .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .contains("aionui-backend.db.plaintext-backup.")
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.strip_prefix(backup_prefix)
+                .is_some_and(|stamp| !stamp.is_empty() && stamp.chars().all(|character| character.is_ascii_digit()))
         })
         .collect();
     assert_eq!(backups.len(), 1, "exactly one plaintext backup should be kept");
