@@ -148,7 +148,7 @@ impl McpOAuthService {
         };
 
         // Open browser.
-        debug!(url = %authorize_url, "Opening browser for OAuth authorization");
+        debug!(server_url, "Opening browser for OAuth authorization");
         if let Err(e) = open::that(&authorize_url) {
             warn!("Failed to open browser: {e}");
         }
@@ -208,7 +208,8 @@ impl McpOAuthService {
     ///
     /// If the stored token is expired and a refresh token is available,
     /// automatically refreshes before returning.
-    /// Returns `None` if no token is stored for this URL.
+    /// Returns `None` if no token is stored or safe refresh is impossible, so
+    /// callers can require reauthentication without sending stale bytes.
     pub async fn get_token(&self, server_url: &str) -> Result<Option<String>, McpError> {
         let row = match self.token_repo.get_by_url(server_url).await? {
             Some(row) => row,
@@ -218,17 +219,28 @@ impl McpOAuthService {
         // Check if token is expired (with safety margin).
         if let Some(expires_at) = row.expires_at {
             let now = now_ms();
-            if now >= expires_at - EXPIRY_MARGIN_MS
-                && let Some(ref refresh_token) = row.refresh_token
-            {
-                match self.refresh_token(server_url, refresh_token).await {
+            if now >= expires_at - EXPIRY_MARGIN_MS {
+                let Some(ref refresh_token) = row.refresh_token else {
+                    warn!(
+                        server_url,
+                        reason = "missing_refresh_token",
+                        "OAuth reauthentication required"
+                    );
+                    return Ok(None);
+                };
+                let Some(ref client_id) = row.client_id else {
+                    warn!(
+                        server_url,
+                        reason = "missing_client_id",
+                        "OAuth reauthentication required"
+                    );
+                    return Ok(None);
+                };
+                match self.refresh_token(server_url, refresh_token, client_id).await {
                     Ok(new_token) => return Ok(Some(new_token)),
-                    Err(e) => {
-                        warn!(
-                            server_url,
-                            error = %e,
-                            "Token refresh failed, returning expired token"
-                        );
+                    Err(_) => {
+                        warn!(server_url, reason = "refresh_failed", "OAuth reauthentication required");
+                        return Ok(None);
                     }
                 }
             }
@@ -267,7 +279,8 @@ impl McpOAuthService {
     /// Return the `Authorization` header value (`"Bearer <token>"`) for
     /// `server_url` if an OAuth token is stored, refreshing it if expired.
     ///
-    /// Returns `None` when no token is stored or a lookup error occurs (logged).
+    /// Returns `None` when no usable token is available or a lookup error
+    /// occurs (logged).
     /// This is the shared building block for attaching the stored token to any
     /// MCP connection — the connection test (via [`Self::inject_authorization`])
     /// and the ACP/native tool-use paths that build their own header types.
@@ -617,17 +630,17 @@ impl McpOAuthService {
     }
 
     /// Refresh an expired access token using the refresh token.
-    async fn refresh_token(&self, server_url: &str, refresh_token_value: &str) -> Result<String, McpError> {
+    async fn refresh_token(
+        &self,
+        server_url: &str,
+        refresh_token_value: &str,
+        client_id: &str,
+    ) -> Result<String, McpError> {
         let metadata = self.discover_endpoints(server_url).await?;
         let token_url =
             TokenUrl::new(metadata.token_endpoint).map_err(|e| McpError::OAuth(format!("Invalid token URL: {e}")))?;
 
-        // NOTE: dynamically registered client IDs are not yet persisted, so
-        // refresh uses the default client ID. Public-client refresh usually
-        // succeeds on the refresh token alone; when a server binds refresh to a
-        // registered client the caller falls back to the stored token (see
-        // `get_token`). Persisting the client ID is a follow-up.
-        let client = BasicClient::new(ClientId::new(DEFAULT_CLIENT_ID.to_string())).set_token_uri(token_url);
+        let client = BasicClient::new(ClientId::new(client_id.to_string())).set_token_uri(token_url);
 
         let http_client = Self::build_no_redirect_client()?;
 
@@ -653,7 +666,7 @@ impl McpOAuthService {
                 server_url,
                 access_token: &new_access_token,
                 refresh_token: Some(new_refresh),
-                client_id: None,
+                client_id: Some(client_id),
                 token_type: "bearer",
                 expires_at,
             })
@@ -1328,10 +1341,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_token_returns_expired_when_no_refresh() {
+    async fn get_token_requires_reauthentication_when_expired_without_refresh() {
         let svc = McpOAuthService::new(Arc::new(ExpiredTokenRepo), reqwest::Client::new());
-        // Expired token with no refresh_token: returns the expired token as-is.
         let token = svc.get_token("https://example.com").await.unwrap();
-        assert_eq!(token.as_deref(), Some("expired_token"));
+        assert_eq!(token, None);
     }
 }

@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use aionui_db::{IOAuthTokenRepository, SqliteOAuthTokenRepository, UpsertOAuthTokenParams};
 use aionui_mcp::McpOAuthService;
+use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 async fn make_service() -> (McpOAuthService, Arc<dyn IOAuthTokenRepository>) {
     let db = aionui_db::init_database_memory().await.unwrap();
@@ -17,6 +19,17 @@ async fn make_service() -> (McpOAuthService, Arc<dyn IOAuthTokenRepository>) {
     // Keep db alive by leaking it (integration test only).
     std::mem::forget(db);
     (svc, repo)
+}
+
+async fn mount_oauth_metadata(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "authorization_endpoint": format!("{}/authorize", server.uri()),
+            "token_endpoint": format!("{}/token", server.uri())
+        })))
+        .mount(server)
+        .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -234,7 +247,49 @@ async fn get_token_returns_access_token_when_valid() {
 }
 
 #[tokio::test]
-async fn get_token_returns_expired_token_when_no_refresh_token() {
+async fn expired_token_refresh_uses_persisted_dynamic_client_and_stores_new_grant() {
+    let server = MockServer::start().await;
+    mount_oauth_metadata(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains("refresh_token=old_refresh"))
+        .and(body_string_contains("client_id=dynamic-client"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "new_access",
+            "refresh_token": "new_refresh",
+            "token_type": "bearer",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (svc, repo) = make_service().await;
+    let server_url = server.uri();
+    repo.upsert(UpsertOAuthTokenParams {
+        server_url: &server_url,
+        access_token: "expired_access",
+        refresh_token: Some("old_refresh"),
+        client_id: Some("dynamic-client"),
+        token_type: "bearer",
+        expires_at: Some(1000),
+    })
+    .await
+    .unwrap();
+
+    let token = svc.get_token(&server_url).await.unwrap();
+    assert_eq!(token.as_deref(), Some("new_access"));
+
+    let stored = repo.get_by_url(&server_url).await.unwrap().unwrap();
+    assert_eq!(stored.access_token, "new_access");
+    assert_eq!(stored.refresh_token.as_deref(), Some("new_refresh"));
+    assert_eq!(stored.client_id.as_deref(), Some("dynamic-client"));
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn get_token_requires_reauthentication_when_expired_without_refresh_token() {
     let (svc, repo) = make_service().await;
 
     repo.upsert(UpsertOAuthTokenParams {
@@ -248,9 +303,140 @@ async fn get_token_returns_expired_token_when_no_refresh_token() {
     .await
     .unwrap();
 
-    // With no refresh_token, returns the expired token as-is.
     let token = svc.get_token("https://expired.example.com").await.unwrap();
-    assert_eq!(token.as_deref(), Some("old_access"));
+    assert_eq!(token, None);
+}
+
+#[tokio::test]
+async fn expired_legacy_token_without_client_id_requires_reauthentication_without_refresh_request() {
+    let server = MockServer::start().await;
+    mount_oauth_metadata(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "must_not_be_used",
+            "token_type": "bearer"
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let (svc, repo) = make_service().await;
+    let server_url = server.uri();
+    repo.upsert(UpsertOAuthTokenParams {
+        server_url: &server_url,
+        access_token: "legacy_expired_access",
+        refresh_token: Some("legacy_refresh"),
+        client_id: None,
+        token_type: "bearer",
+        expires_at: Some(1000),
+    })
+    .await
+    .unwrap();
+
+    let token = svc.get_token(&server_url).await.unwrap();
+    assert_eq!(token, None);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn refresh_http_failure_requires_reauthentication_without_returning_stale_token() {
+    let server = MockServer::start().await;
+    mount_oauth_metadata(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("client_id=dynamic-client"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("temporary outage"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (svc, repo) = make_service().await;
+    let server_url = server.uri();
+    repo.upsert(UpsertOAuthTokenParams {
+        server_url: &server_url,
+        access_token: "stale_access_must_not_escape",
+        refresh_token: Some("refresh-token"),
+        client_id: Some("dynamic-client"),
+        token_type: "bearer",
+        expires_at: Some(1000),
+    })
+    .await
+    .unwrap();
+
+    let token = svc.get_token(&server_url).await.unwrap();
+    assert_eq!(token, None);
+    assert_eq!(
+        repo.get_by_url(&server_url).await.unwrap().unwrap().access_token,
+        "stale_access_must_not_escape"
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn malformed_refresh_response_requires_reauthentication_without_returning_stale_token() {
+    let server = MockServer::start().await;
+    mount_oauth_metadata(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (svc, repo) = make_service().await;
+    let server_url = server.uri();
+    repo.upsert(UpsertOAuthTokenParams {
+        server_url: &server_url,
+        access_token: "stale_access_must_not_escape",
+        refresh_token: Some("refresh-token"),
+        client_id: Some("dynamic-client"),
+        token_type: "bearer",
+        expires_at: Some(1000),
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(svc.get_token(&server_url).await.unwrap(), None);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn successful_reauthentication_restores_bearer_injection() {
+    let (svc, repo) = make_service().await;
+    let server_url = "https://reauth.example.com";
+    repo.upsert(UpsertOAuthTokenParams {
+        server_url,
+        access_token: "legacy_expired_access",
+        refresh_token: Some("legacy_refresh"),
+        client_id: None,
+        token_type: "bearer",
+        expires_at: Some(1000),
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(svc.bearer_for(server_url).await, None);
+
+    repo.upsert(UpsertOAuthTokenParams {
+        server_url,
+        access_token: "reauthorized_access",
+        refresh_token: Some("reauthorized_refresh"),
+        client_id: Some("new-dynamic-client"),
+        token_type: "bearer",
+        expires_at: Some(aionui_common::now_ms() + 3_600_000),
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        svc.bearer_for(server_url).await.as_deref(),
+        Some("Bearer reauthorized_access")
+    );
+    assert_eq!(
+        repo.get_by_url(server_url).await.unwrap().unwrap().client_id.as_deref(),
+        Some("new-dynamic-client")
+    );
 }
 
 #[tokio::test]
