@@ -638,7 +638,7 @@ mod tests {
             command: "sh".into(),
             args: vec![
                 "-c".into(),
-                "printf '%s\n' \"$$\" > \"$1\"; sleep 30".into(),
+                "sleep 30 & child=$!; printf '%s %s\n' \"$$\" \"$child\" > \"$1\"; wait".into(),
                 "mcp-timeout-child".into(),
                 marker_path.to_string_lossy().into_owned(),
             ],
@@ -654,47 +654,72 @@ mod tests {
             "expected timeout result, got {result:?}"
         );
 
-        let pid: i32 = std::fs::read_to_string(&marker_path)
-            .expect("stdio child should write its pid")
-            .trim()
-            .parse()
-            .expect("pid marker should be numeric");
+        let marker = std::fs::read_to_string(&marker_path).expect("stdio child should write process ids");
+        let mut pids = marker.split_whitespace();
+        let group_pid: i32 = pids.next().unwrap().parse().expect("group pid should be numeric");
+        let descendant_pid: i32 = pids.next().unwrap().parse().expect("descendant pid should be numeric");
 
-        let group_alive = wait_for_process_group_exit(pid, Duration::from_secs(1)).await;
-        if group_alive {
-            let _ = kill_process_group(pid, libc_sigkill());
+        let descendant_running = wait_for_process_to_stop_running(descendant_pid, Duration::from_secs(1)).await;
+        if descendant_running {
+            let _ = kill_process_group(group_pid, libc_sigkill());
         }
         let _ = std::fs::remove_file(marker_path);
 
         assert!(
-            !group_alive,
-            "stdio timeout should terminate the spawned process group for pid={pid}"
+            !descendant_running,
+            "stdio timeout should terminate runnable descendants for group={group_pid}, descendant={descendant_pid}"
         );
     }
 
     #[cfg(unix)]
-    async fn wait_for_process_group_exit(pid: i32, timeout: Duration) -> bool {
+    async fn wait_for_process_to_stop_running(pid: i32, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
-            if !is_process_group_alive(pid) {
+            if !is_process_runnable(pid) {
                 return false;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        is_process_group_alive(pid)
+        is_process_runnable(pid)
     }
 
-    #[cfg(unix)]
-    fn is_process_group_alive(pid: i32) -> bool {
-        kill_process_group(pid, 0)
+    #[cfg(target_os = "macos")]
+    fn is_process_runnable(pid: i32) -> bool {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        let read = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
+        if read != size {
+            return false;
+        }
+        unsafe { info.assume_init().pbi_status != libc::SZOMB }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_process_runnable(pid: i32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        stat.rsplit_once(") ")
+            .and_then(|(_, suffix)| suffix.chars().next())
+            .is_some_and(|state| state != 'Z' && state != 'X')
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn is_process_runnable(pid: i32) -> bool {
+        kill_process(pid, 0)
     }
 
     #[cfg(unix)]
     fn kill_process_group(pid: i32, signal: i32) -> bool {
+        kill_process(-pid, signal)
+    }
+
+    #[cfg(unix)]
+    fn kill_process(pid: i32, signal: i32) -> bool {
         unsafe extern "C" {
             fn kill(pid: i32, sig: i32) -> i32;
         }
-        unsafe { kill(-pid, signal) == 0 }
+        unsafe { kill(pid, signal) == 0 }
     }
 
     #[cfg(unix)]

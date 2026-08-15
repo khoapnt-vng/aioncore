@@ -31,3 +31,4 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 tracing-subscriber.workspace = true
 wiremock.workspace = true
+libc.workspace = true

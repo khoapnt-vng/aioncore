@@ -702,6 +702,7 @@ dependencies = [
  "axum",
  "dashmap",
  "dirs",
+ "libc",
  "oauth2",
  "open",
  "reqwest",
