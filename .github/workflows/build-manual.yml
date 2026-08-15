@@ -90,6 +90,11 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare-matrix.outputs.matrix) }}
 
     steps:
+      - name: Configure LF checkout on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
       - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.branch || github.sha }}

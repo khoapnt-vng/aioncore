@@ -107,6 +107,15 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn('inputs.branch || github.sha', self.manual_text)
         self.assertIn('if [ "$PLATFORM" = "internal-two-target" ]', self.manual_text)
 
+    def test_windows_disables_crlf_conversion_before_checkout(self):
+        steps = self.manual["jobs"]["build"]["steps"]
+        configure_index = next(
+            index for index, step in enumerate(steps) if step.get("name") == "Configure LF checkout on Windows"
+        )
+        checkout_index = next(index for index, step in enumerate(steps) if step.get("uses", "").startswith("actions/checkout@"))
+        self.assertLess(configure_index, checkout_index)
+        self.assertIn("core.autocrlf false", steps[configure_index]["run"])
+
     def test_workflow_has_no_force_or_overwrite_archive_path(self):
         forbidden = ["--force", "--clobber", "Compress-Archive -Force", "Remove-Item dist"]
         for token in forbidden:
