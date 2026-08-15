@@ -8,6 +8,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 RELEASE_PATH = ROOT / ".github" / "workflows" / "release.yml"
 CI_PATH = ROOT / ".github" / "workflows" / "ci.yml"
+MANUAL_PATH = ROOT / ".github" / "workflows" / "build-manual.yml"
 APPROVED_TARGETS = {"aarch64-apple-darwin", "x86_64-pc-windows-msvc"}
 
 
@@ -18,6 +19,8 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         cls.release = yaml.safe_load(cls.release_text)
         cls.ci_text = CI_PATH.read_text(encoding="utf-8")
         cls.ci = yaml.safe_load(cls.ci_text)
+        cls.manual_text = MANUAL_PATH.read_text(encoding="utf-8")
+        cls.manual = yaml.safe_load(cls.manual_text)
 
     def test_release_matrix_is_exactly_the_two_approved_native_targets(self):
         include = self.release["jobs"]["build"]["strategy"]["matrix"]["include"]
@@ -88,6 +91,14 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
     def test_ci_runs_all_release_python_contract_tests(self):
         scripts = self._job_script("release-contract", workflow=self.ci)
         self.assertIn("unittest discover -s scripts/release", scripts)
+
+    def test_manual_build_uploads_a_complete_bundle_for_internal_packaging(self):
+        build = self._job_script("build", workflow=self.manual)
+        self.assertIn("prepare-managed-resources", build)
+        self.assertIn("prepare_officecli.py", build)
+        self.assertIn("assemble_bundle.py", build)
+        self.assertIn("verify_bundle.py", build)
+        self.assertIn("work/bundle", build)
 
     def test_workflow_has_no_force_or_overwrite_archive_path(self):
         forbidden = ["--force", "--clobber", "Compress-Archive -Force", "Remove-Item dist"]

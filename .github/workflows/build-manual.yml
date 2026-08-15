@@ -135,6 +135,41 @@ jobs:
             cargo build --release --target ${{ matrix.target }} -p aionui-app
           fi
 
+      - name: Prepare complete internal-test bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
+          test -f "${binary}"
+          python3 scripts/migration/generate-lineage.py \
+            --migrations crates/aionui-db/migrations \
+            --check migration-lineage.json
+          "${binary}" \
+            --data-dir "${PWD}/work/release-data" \
+            prepare-managed-resources \
+            --bundle-out "${PWD}/work/managed-resources"
+          python3 scripts/release/prepare_officecli.py \
+            --managed-resources work/managed-resources \
+            --target "${{ matrix.target }}"
+          source_commit="$(git rev-parse HEAD)"
+          built_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          python3 scripts/release/assemble_bundle.py \
+            --binary "${binary}" \
+            --lineage migration-lineage.json \
+            --managed-resources work/managed-resources \
+            --output work/bundle \
+            --repository khoapnt-vng/aioncore \
+            --version 0.1.55 \
+            --source-commit "${source_commit}" \
+            --target "${{ matrix.target }}" \
+            --built-at "${built_at}"
+          python3 scripts/release/verify_bundle.py \
+            --bundle work/bundle \
+            --repository khoapnt-vng/aioncore \
+            --version 0.1.55 \
+            --source-commit "${source_commit}" \
+            --target "${{ matrix.target }}"
+
       - name: Verify Linux ARM64 GLIBC baseline
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
@@ -153,7 +188,7 @@ jobs:
         run: |
           mkdir -p dist
           ARCHIVE="aioncore-${COMMIT_SHORT}-${{ matrix.target }}.tar.gz"
-          tar -C target/${{ matrix.target }}/release -czf "dist/${ARCHIVE}" ${{ matrix.binary_name }}
+          tar -C work/bundle -czf "dist/${ARCHIVE}" .
           echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
 
       - name: Package binary (Windows)
@@ -164,7 +199,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $archive = "aioncore-${env:COMMIT_SHORT}-${{ matrix.target }}.zip"
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" -DestinationPath "dist/${archive}" -Force
+          Compress-Archive -Path "work/bundle/*" -DestinationPath "dist/${archive}" -Force
           "ARCHIVE=${archive}" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload manual build artifact
