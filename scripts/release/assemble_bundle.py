@@ -65,10 +65,24 @@ def expected_binary_name(target: str) -> str:
 
 def copy_managed_resources(source: Path, destination: Path) -> None:
     destination.mkdir()
+    source_root = source.resolve(strict=True)
     for path in sorted(source.rglob("*")):
         if path.is_symlink():
-            raise BundleAssemblyError(f"managed resources contain symlink: {path}")
+            try:
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(source_root)
+            except (OSError, ValueError) as error:
+                raise BundleAssemblyError(f"managed resource symlink escapes its root: {path}") from error
+            if not resolved.is_file():
+                raise BundleAssemblyError(f"managed resource symlink must resolve to a regular file: {path}")
+            relative = path.relative_to(source)
+            output = destination / relative
+            output.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(resolved, output)
+            continue
         relative = path.relative_to(source)
+        if relative.parts[0] == ".staging":
+            continue
         output = destination / relative
         if path.is_dir():
             output.mkdir(exist_ok=True)

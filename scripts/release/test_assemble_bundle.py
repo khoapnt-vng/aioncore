@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -171,6 +172,27 @@ class BundleTests(unittest.TestCase):
         link.symlink_to(bundle / "managed-resources" / "runtime" / "tool.txt")
         with self.assertRaisesRegex(verify_bundle.BundleError, "symlink"):
             self.verify(bundle)
+
+    @unittest.skipIf(os.name == "nt", "creating symlinks requires additional Windows privileges")
+    def test_assembler_materializes_safe_managed_resource_symlinks(self):
+        link = self.managed / "runtime" / "tool-link"
+        link.symlink_to("tool.txt")
+
+        bundle = self.assemble()
+        materialized = bundle / "managed-resources" / "runtime" / "tool-link"
+
+        self.assertFalse(materialized.is_symlink())
+        self.assertEqual(materialized.read_bytes(), b"managed-tool\n")
+        self.verify(bundle)
+
+    @unittest.skipIf(os.name == "nt", "creating symlinks requires additional Windows privileges")
+    def test_assembler_rejects_managed_resource_symlinks_that_escape_root(self):
+        outside = self.root / "outside.txt"
+        outside.write_bytes(b"outside")
+        (self.managed / "escaping-link").symlink_to(outside)
+
+        with self.assertRaisesRegex(assemble_bundle.BundleAssemblyError, "escapes its root"):
+            self.assemble()
 
     def test_verifier_rejects_absolute_and_parent_escape_manifest_paths(self):
         cases = ["/tmp/aioncore", "managed-resources/../aioncore"]
