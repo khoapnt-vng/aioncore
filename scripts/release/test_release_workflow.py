@@ -58,6 +58,19 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("gh release create", publish)
         self.assertIn("aioncore-checksums.txt", publish)
 
+    def test_only_github_release_job_has_write_permission(self):
+        self.assertEqual(self.release["permissions"], {"contents": "read"})
+        self.assertEqual(
+            self.release["jobs"]["github-release"].get("permissions"),
+            {"contents": "write"},
+        )
+        for job_name in ("prepare-release", "build"):
+            with self.subTest(job_name=job_name):
+                self.assertNotEqual(
+                    self.release["jobs"][job_name].get("permissions", {}).get("contents"),
+                    "write",
+                )
+
     def test_build_evidence_includes_manifest_and_logs(self):
         build = self.release["jobs"]["build"]
         upload_steps = [
