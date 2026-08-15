@@ -79,6 +79,18 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertNotIn(token, self.release_text)
 
+    def test_release_actions_are_pinned_to_full_commit_shas(self):
+        action_refs = [
+            step["uses"]
+            for job in self.release["jobs"].values()
+            for step in job.get("steps", [])
+            if "uses" in step and not step["uses"].startswith("./")
+        ]
+        self.assertTrue(action_refs)
+        for action_ref in action_refs:
+            with self.subTest(action_ref=action_ref):
+                self.assertRegex(action_ref, r"^[^@]+@[0-9a-f]{40}$")
+
     @staticmethod
     def _job_script(name, workflow=None):
         workflow = workflow or ReleaseWorkflowContractTests.release
