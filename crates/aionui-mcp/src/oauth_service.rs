@@ -412,10 +412,7 @@ impl McpOAuthService {
 
         // Prefer the pointer from the WWW-Authenticate challenge (RFC 9728).
         if let Ok(resp) = self.http_client.get(server_url).send().await
-            && let Some(header) = resp
-                .headers()
-                .get("www-authenticate")
-                .and_then(|v| v.to_str().ok())
+            && let Some(header) = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok())
             && let Some(url) = parse_resource_metadata_pointer(header)
         {
             prm_urls.push(url);
@@ -477,7 +474,9 @@ impl McpOAuthService {
         if !resp.status().is_success() {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
-            return Err(McpError::OAuth(format!("Client registration returned {status}: {detail}")));
+            return Err(McpError::OAuth(format!(
+                "Client registration returned {status}: {detail}"
+            )));
         }
 
         let registration: ClientRegistrationResponse = resp
@@ -856,7 +855,10 @@ mod tests {
         let McpServerTransport::Http { headers, .. } = &transport else {
             panic!("expected http transport");
         };
-        assert_eq!(headers.get("Authorization").map(String::as_str), Some("Bearer valid_access_token"));
+        assert_eq!(
+            headers.get("Authorization").map(String::as_str),
+            Some("Bearer valid_access_token")
+        );
     }
 
     #[tokio::test]
@@ -870,7 +872,10 @@ mod tests {
         let McpServerTransport::Sse { headers, .. } = &transport else {
             panic!("expected sse transport");
         };
-        assert_eq!(headers.get("Authorization").map(String::as_str), Some("Bearer valid_access_token"));
+        assert_eq!(
+            headers.get("Authorization").map(String::as_str),
+            Some("Bearer valid_access_token")
+        );
     }
 
     #[tokio::test]
@@ -879,13 +884,22 @@ mod tests {
         let mut headers = std::collections::HashMap::new();
         // Case-insensitive match: a user-supplied static PAT must not be clobbered.
         headers.insert("authorization".to_string(), "Bearer user_pat".to_string());
-        let mut transport = McpServerTransport::Http { url: "https://example.com".to_string(), headers };
+        let mut transport = McpServerTransport::Http {
+            url: "https://example.com".to_string(),
+            headers,
+        };
         svc.inject_authorization(&mut transport).await;
         let McpServerTransport::Http { headers, .. } = &transport else {
             panic!("expected http transport");
         };
-        assert_eq!(headers.get("authorization").map(String::as_str), Some("Bearer user_pat"));
-        assert!(!headers.contains_key("Authorization"), "must not add a second Authorization header");
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some("Bearer user_pat")
+        );
+        assert!(
+            !headers.contains_key("Authorization"),
+            "must not add a second Authorization header"
+        );
     }
 
     #[tokio::test]
@@ -998,8 +1012,14 @@ mod tests {
 
     #[test]
     fn origin_of_strips_path() {
-        assert_eq!(origin_of("https://github.com/login/oauth").unwrap(), "https://github.com");
-        assert_eq!(origin_of("https://mcp.atlassian.com/v1/sse").unwrap(), "https://mcp.atlassian.com");
+        assert_eq!(
+            origin_of("https://github.com/login/oauth").unwrap(),
+            "https://github.com"
+        );
+        assert_eq!(
+            origin_of("https://mcp.atlassian.com/v1/sse").unwrap(),
+            "https://mcp.atlassian.com"
+        );
         assert_eq!(origin_of("https://host:8443/a/b").unwrap(), "https://host:8443");
         assert_eq!(origin_of("https://github.com").unwrap(), "https://github.com");
         assert!(origin_of("not-a-url").is_none());

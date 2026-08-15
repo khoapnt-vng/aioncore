@@ -170,7 +170,10 @@ mod tests {
         assert!(candidate.starts_with(tmp.path()));
         assert_eq!(candidate.parent().unwrap().file_name().unwrap(), "office");
         write_marker_file(&candidate);
-        assert_eq!(resolve_bundled_officecli_path_from_root(Some(tmp.path())), Some(candidate));
+        assert_eq!(
+            resolve_bundled_officecli_path_from_root(Some(tmp.path())),
+            Some(candidate)
+        );
     }
 
     #[test]

@@ -867,16 +867,19 @@ mod tests {
         pat.insert("authorization".to_owned(), "Bearer user_pat".to_owned());
         let mut servers = HashMap::from([
             ("gh".to_owned(), http_config("https://api.example.com/mcp", Some(pat))),
-            ("local".to_owned(), McpServerConfig {
-                transport: TransportType::Stdio,
-                command: Some("echo".into()),
-                args: None,
-                env: None,
-                url: None,
-                headers: None,
-                deferred: Some(false),
-                startup_timeout_ms: None,
-            }),
+            (
+                "local".to_owned(),
+                McpServerConfig {
+                    transport: TransportType::Stdio,
+                    command: Some("echo".into()),
+                    args: None,
+                    env: None,
+                    url: None,
+                    headers: None,
+                    deferred: Some(false),
+                    startup_timeout_ms: None,
+                },
+            ),
         ]);
         inject_oauth_headers(&mut servers, &oauth, "conv-1").await;
         let gh = servers["gh"].headers.as_ref().unwrap();
