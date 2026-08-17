@@ -26,6 +26,15 @@ const STARTUP_FILE_RETRY_DELAYS: [Duration; 5] = [
 ];
 
 static DB_MIGRATOR: Migrator = sqlx::migrate!();
+// Older native Windows builds compiled migrations after Git converted LF to
+// CRLF, so SQLx recorded a different SHA-384 for semantically identical SQL.
+// Keep both sides pinned so this bridge cannot authorize a future migration-1
+// rewrite or an unrelated checksum mismatch.
+const INITIAL_MIGRATION_VERSION: i64 = 1;
+const INITIAL_MIGRATION_LF_CHECKSUM_HEX: &str =
+    "e18a4394627489c083778138a695aaf94df3a8754f34ca0aab079b4ec92779dd70a81fcf67472c53e18fc8bec2512c54";
+const INITIAL_MIGRATION_WINDOWS_CRLF_CHECKSUM_HEX: &str =
+    "d4dd44158a52ea3a140189b5a778aa85728f009455ca5f764bc7e6bf8e9682deae285ab2b2a2f15b6136ff0b7879740e";
 // Historical special-case for the MCP schema reconciliation fallback.
 // Keep this pinned to migration version 7 even as newer migrations land.
 const MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION: i64 = 7;
@@ -420,6 +429,19 @@ async fn run_migrations_with_retry(conn: &mut sqlx::SqliteConnection) -> Result<
             warn!("Concurrent migrator detected (UNIQUE conflict on _sqlx_migrations); retrying");
             DB_MIGRATOR.run(&mut *conn).await.map_err(DbError::Migration)
         }
+        Err(sqlx::migrate::MigrateError::VersionMismatch(version)) if version == INITIAL_MIGRATION_VERSION => {
+            if align_windows_crlf_initial_migration_checksum(&mut *conn).await? {
+                warn!(
+                    migration_version = INITIAL_MIGRATION_VERSION,
+                    "Aligned the known Windows CRLF checksum for the initial migration; retrying"
+                );
+                DB_MIGRATOR.run(&mut *conn).await.map_err(DbError::Migration)
+            } else {
+                Err(DbError::Migration(sqlx::migrate::MigrateError::VersionMismatch(
+                    version,
+                )))
+            }
+        }
         Err(sqlx::migrate::MigrateError::VersionMismatch(version))
             if version == MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION =>
         {
@@ -447,6 +469,57 @@ async fn run_migrations_with_retry(conn: &mut sqlx::SqliteConnection) -> Result<
 fn is_migrations_table_unique_conflict(err: &sqlx::migrate::MigrateError) -> bool {
     let msg = err.to_string();
     msg.contains("UNIQUE constraint failed: _sqlx_migrations.version")
+}
+
+async fn align_windows_crlf_initial_migration_checksum(conn: &mut sqlx::SqliteConnection) -> Result<bool, DbError> {
+    let Some(migration) = DB_MIGRATOR
+        .iter()
+        .find(|migration| migration.version == INITIAL_MIGRATION_VERSION)
+    else {
+        return Ok(false);
+    };
+
+    let current_checksum_hex = migration
+        .checksum
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if current_checksum_hex != INITIAL_MIGRATION_LF_CHECKSUM_HEX {
+        return Ok(false);
+    }
+
+    let stored: Option<(String, bool, String)> = sqlx::query_as(
+        "SELECT description, success, lower(hex(checksum)) \
+         FROM _sqlx_migrations WHERE version = ?",
+    )
+    .bind(INITIAL_MIGRATION_VERSION)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(DbError::Query)?;
+    let Some((description, success, stored_checksum_hex)) = stored else {
+        return Ok(false);
+    };
+    if !success
+        || description != migration.description.as_ref()
+        || stored_checksum_hex != INITIAL_MIGRATION_WINDOWS_CRLF_CHECKSUM_HEX
+    {
+        return Ok(false);
+    }
+
+    let updated = sqlx::query(
+        "UPDATE _sqlx_migrations SET checksum = ? \
+         WHERE version = ? AND description = ? AND success = TRUE \
+         AND lower(hex(checksum)) = ?",
+    )
+    .bind(&*migration.checksum)
+    .bind(INITIAL_MIGRATION_VERSION)
+    .bind(migration.description.as_ref())
+    .bind(INITIAL_MIGRATION_WINDOWS_CRLF_CHECKSUM_HEX)
+    .execute(&mut *conn)
+    .await
+    .map_err(DbError::Query)?;
+
+    Ok(updated.rows_affected() == 1)
 }
 
 /// RAII guard that holds an exclusive file lock for the lifetime of the
@@ -819,6 +892,118 @@ fn is_corruption_like_error(err: &DbError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Connection;
+
+    async fn migrated_connection_with_sentinel() -> sqlx::SqliteConnection {
+        let mut conn = sqlx::SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        DB_MIGRATOR.run(&mut conn).await.unwrap();
+        sqlx::query("CREATE TABLE compatibility_sentinel (value TEXT NOT NULL)")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO compatibility_sentinel (value) VALUES ('preserve-me')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn
+    }
+
+    #[tokio::test]
+    async fn known_windows_crlf_migration_checksum_is_normalized_without_losing_data() {
+        let mut conn = migrated_connection_with_sentinel().await;
+        sqlx::query(
+            "UPDATE _sqlx_migrations \
+             SET checksum = X'd4dd44158a52ea3a140189b5a778aa85728f009455ca5f764bc7e6bf8e9682deae285ab2b2a2f15b6136ff0b7879740e' \
+             WHERE version = 1",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        run_migrations_with_retry(&mut conn).await.unwrap();
+
+        let stored_checksum: String =
+            sqlx::query_scalar("SELECT lower(hex(checksum)) FROM _sqlx_migrations WHERE version = 1")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored_checksum,
+            "e18a4394627489c083778138a695aaf94df3a8754f34ca0aab079b4ec92779dd70a81fcf67472c53e18fc8bec2512c54"
+        );
+
+        let sentinel: String = sqlx::query_scalar("SELECT value FROM compatibility_sentinel")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(sentinel, "preserve-me");
+    }
+
+    #[tokio::test]
+    async fn unknown_migration_one_checksum_remains_rejected_and_unchanged() {
+        let mut conn = migrated_connection_with_sentinel().await;
+        sqlx::query(
+            "UPDATE _sqlx_migrations \
+             SET checksum = X'000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000' \
+             WHERE version = 1",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        let error = run_migrations_with_retry(&mut conn).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            DbError::Migration(sqlx::migrate::MigrateError::VersionMismatch(1))
+        ));
+        let stored_checksum: String =
+            sqlx::query_scalar("SELECT lower(hex(checksum)) FROM _sqlx_migrations WHERE version = 1")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored_checksum,
+            "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        );
+
+        let sentinel: String = sqlx::query_scalar("SELECT value FROM compatibility_sentinel")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(sentinel, "preserve-me");
+    }
+
+    #[tokio::test]
+    async fn known_windows_crlf_checksum_with_changed_identity_remains_rejected() {
+        let mut conn = migrated_connection_with_sentinel().await;
+        sqlx::query(
+            "UPDATE _sqlx_migrations \
+             SET description = 'changed identity', \
+                 checksum = X'd4dd44158a52ea3a140189b5a778aa85728f009455ca5f764bc7e6bf8e9682deae285ab2b2a2f15b6136ff0b7879740e' \
+             WHERE version = 1",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        let error = run_migrations_with_retry(&mut conn).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            DbError::Migration(sqlx::migrate::MigrateError::VersionMismatch(1))
+        ));
+        let stored: (String, String) =
+            sqlx::query_as("SELECT description, lower(hex(checksum)) FROM _sqlx_migrations WHERE version = 1")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(stored.0, "changed identity");
+        assert_eq!(
+            stored.1,
+            "d4dd44158a52ea3a140189b5a778aa85728f009455ca5f764bc7e6bf8e9682deae285ab2b2a2f15b6136ff0b7879740e"
+        );
+    }
 
     #[test]
     fn recovery_skips_migration_version_mismatch() {

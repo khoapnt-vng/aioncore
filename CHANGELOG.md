@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Bug Fixes
+
+- **db:** normalize the known Windows CRLF checksum for migration 1 without accepting unknown migration histories
+
 ## [0.1.55](https://github.com/khoapnt-vng/aioncore/compare/v0.1.54...v0.1.55) (2026-08-15)
 
 ### Security
