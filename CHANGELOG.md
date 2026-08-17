@@ -4,7 +4,7 @@
 
 ### Bug Fixes
 
-- **db:** normalize the known Windows CRLF checksum for migration 1 without accepting unknown migration histories
+- **db:** atomically normalize a verified Windows CRLF migration set, including databases partially aligned by WePrompt 2.1.40, without accepting mixed or unknown histories
 
 ## [0.1.55](https://github.com/khoapnt-vng/aioncore/compare/v0.1.54...v0.1.55) (2026-08-15)
 
