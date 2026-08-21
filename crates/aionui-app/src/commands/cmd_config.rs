@@ -21,6 +21,7 @@ use crate::commands::config_capabilities;
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
 const ENV_CONVERSATION_ID: &str = "AIONUI_CONVERSATION_ID";
 const ENV_USER_ID: &str = "AIONUI_USER_ID";
+const ENV_LOCAL_TOKEN: &str = "AIONUI_LOCAL_TOKEN";
 
 pub async fn run_config(args: ConfigArgs) -> ExitCode {
     match run(args).await {
@@ -1241,6 +1242,10 @@ struct ConfigEnv {
     base_url: String,
     conversation_id: String,
     user_id: String,
+    /// Loopback auth token for local mode. `Some` when `AIONUI_LOCAL_TOKEN` is set;
+    /// attached as `Authorization: Bearer` so the backend's auth middleware accepts
+    /// the request instead of returning 401.
+    local_token: Option<String>,
 }
 
 impl ConfigEnv {
@@ -1249,8 +1254,16 @@ impl ConfigEnv {
             base_url: required_env(command, ENV_BASE_URL)?.trim_end_matches('/').to_owned(),
             conversation_id: required_env(command, ENV_CONVERSATION_ID)?,
             user_id: required_env(command, ENV_USER_ID)?,
+            local_token: optional_env(ENV_LOCAL_TOKEN),
         })
     }
+}
+
+fn optional_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn required_env(command: &str, name: &'static str) -> Result<String, ConfigError> {
@@ -1385,6 +1398,9 @@ async fn request_json(
         .header("content-type", "application/json")
         .header("x-aionui-conversation-id", &env.conversation_id)
         .header("x-aionui-user-id", &env.user_id);
+    if let Some(token) = &env.local_token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
     if let Some(body) = body {
         request = request.json(&body);
     }
@@ -1798,5 +1814,79 @@ mod tests {
     #[test]
     fn path_segments_are_percent_encoded() {
         assert_eq!(encode_path_segment("a/b c"), "a%2Fb%20c");
+    }
+
+    fn config_env_with_token(base_url: String, local_token: Option<&str>) -> ConfigEnv {
+        ConfigEnv {
+            base_url,
+            conversation_id: "conv-1".to_owned(),
+            user_id: "user-1".to_owned(),
+            local_token: local_token.map(str::to_owned),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_json_attaches_local_token_as_bearer() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/internal/conversation-cron/list"))
+            .and(header("authorization", "Bearer test-local-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let env = config_env_with_token(server.uri(), Some("test-local-token"));
+
+        let value = request_json(
+            &client,
+            &env,
+            Method::GET,
+            "/api/internal/conversation-cron/list",
+            None,
+            "config cron current list",
+        )
+        .await
+        .expect("request should succeed when the loopback token is attached");
+
+        assert_eq!(value, serde_json::json!({"ok": true}));
+    }
+
+    #[tokio::test]
+    async fn request_json_without_token_is_rejected_by_auth() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Mirror the backend's auth middleware: only a request carrying the exact loopback
+        // token is accepted. Without AIONUI_LOCAL_TOKEN no Authorization header is sent, so
+        // this mock never matches and wiremock replies 404 — the request fails, reproducing
+        // the customer-reported 401 (any non-success status maps to HttpStatusError).
+        Mock::given(method("GET"))
+            .and(path("/api/internal/conversation-cron/list"))
+            .and(header("authorization", "Bearer test-local-token"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let env = config_env_with_token(server.uri(), None);
+
+        let error = request_json(
+            &client,
+            &env,
+            Method::GET,
+            "/api/internal/conversation-cron/list",
+            None,
+            "config cron current list",
+        )
+        .await
+        .expect_err("request without the loopback token must fail");
+
+        assert!(matches!(error.code, ConfigErrorCode::HttpStatusError));
     }
 }

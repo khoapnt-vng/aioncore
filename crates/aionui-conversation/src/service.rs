@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
-use aionui_ai_agent::types::BuildTaskOptions;
+use aionui_ai_agent::types::{AIONUI_LOCAL_TOKEN_ENV, BuildTaskOptions};
 use aionui_ai_agent::{
     ActiveLeaseRegistry, AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager,
     RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
@@ -3280,12 +3280,19 @@ impl ConversationService {
         conversation_id: &str,
     ) {
         let runtime_token = self.runtime_token_for_build(build_opts, user_id, conversation_id);
+        // In local mode the config helper (`config cron/mcp/skill`) must authenticate to the
+        // loopback backend, which requires the per-session token supplied via AIONUI_LOCAL_TOKEN.
+        // Team contexts authenticate with the runtime token instead, so this stays None there.
+        let local_token = std::env::var(AIONUI_LOCAL_TOKEN_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
         build_opts.apply_conversation_runtime_context(
             user_id,
             conversation_id,
             self.runtime_helper_bin.as_deref(),
             self.runtime_base_url.as_deref(),
             runtime_token.as_deref(),
+            local_token.as_deref(),
         );
     }
 
