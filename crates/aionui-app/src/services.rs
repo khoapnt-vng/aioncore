@@ -58,8 +58,8 @@ pub struct AppServices {
     /// When `true`, skip JWT authentication and use a fixed default user.
     pub local: bool,
     /// SECURITY (D-01): per-session loopback token required for local-mode requests.
-    /// `Some` in production local mode (from `AIONUI_LOCAL_TOKEN`); `None` only for
-    /// tests / dev that construct services directly.
+    /// `Some` in production local mode (from secure pre-runtime bootstrap); `None`
+    /// only for tests / dev that construct services directly.
     pub local_token: Option<Arc<str>>,
     pub app_version: String,
     /// Resolved skill paths. Shared with the `ConversationService` for

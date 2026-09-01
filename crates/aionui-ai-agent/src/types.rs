@@ -61,6 +61,8 @@ impl BuildTaskOptions {
                     | AIONUI_BASE_URL_ENV
                     | AIONUI_RUNTIME_TOKEN_ENV
                     | AIONUI_LOCAL_TOKEN_ENV
+                    | AIONUI_BOOTSTRAP_SECRETS_STDIN_ENV
+                    | AIONUI_SESSION_MCP_TRUST_KEY_ENV
             )
         });
         self.context
@@ -95,6 +97,12 @@ pub const AIONUI_BASE_URL_ENV: &str = "AIONUI_BASE_URL";
 pub const AIONUI_RUNTIME_TOKEN_ENV: &str = "AIONUI_RUNTIME_TOKEN";
 /// Full local API bearer. It is server-only and must never reach an agent or child process.
 pub const AIONUI_LOCAL_TOKEN_ENV: &str = "AIONUI_LOCAL_TOKEN";
+/// Non-secret bootstrap selector. Strip it so nested AionCore helpers cannot
+/// accidentally reinterpret ordinary tool stdin as a secret envelope.
+pub const AIONUI_BOOTSTRAP_SECRETS_STDIN_ENV: &str = "AIONUI_BOOTSTRAP_SECRETS_STDIN";
+/// Session MCP signing authority. It is server-only and must never reach an
+/// agent or child process, even if stale runtime context contains the key.
+pub const AIONUI_SESSION_MCP_TRUST_KEY_ENV: &str = "AIONUI_SESSION_MCP_TRUST_KEY";
 pub const CONVERSATION_RUNTIME_CONTEXT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -205,6 +213,8 @@ mod tests {
                 (AIONUI_CONVERSATION_ID_ENV.into(), "old-conv".into()),
                 (AIONUI_RUNTIME_TOKEN_ENV.into(), "old-token".into()),
                 (AIONUI_LOCAL_TOKEN_ENV.into(), "must-not-survive".into()),
+                (AIONUI_BOOTSTRAP_SECRETS_STDIN_ENV.into(), "1".into()),
+                (AIONUI_SESSION_MCP_TRUST_KEY_ENV.into(), "must-not-survive".into()),
                 ("EXISTING".into(), "1".into()),
             ],
             team: None,
@@ -235,13 +245,13 @@ mod tests {
                 .count(),
             1
         );
-        assert!(
-            options
-                .context
-                .runtime_env
-                .iter()
-                .all(|(key, _)| key != AIONUI_LOCAL_TOKEN_ENV)
-        );
+        for forbidden in [
+            AIONUI_LOCAL_TOKEN_ENV,
+            AIONUI_BOOTSTRAP_SECRETS_STDIN_ENV,
+            AIONUI_SESSION_MCP_TRUST_KEY_ENV,
+        ] {
+            assert!(options.context.runtime_env.iter().all(|(key, _)| key != forbidden));
+        }
         assert!(
             options
                 .context

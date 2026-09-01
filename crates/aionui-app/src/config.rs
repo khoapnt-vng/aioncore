@@ -36,12 +36,12 @@ pub struct AppConfig {
     /// Run in local embedded mode (skip authentication, use system_default_user).
     pub local: bool,
     /// SECURITY (D-01): per-session loopback token required for local-mode API/WS
-    /// requests. Populated from the `AIONUI_LOCAL_TOKEN` env var at startup. When
-    /// `local` is set, the server refuses to start without it (see `init_environment`).
+    /// requests. Populated from the pre-runtime stdin bootstrap envelope. When `local`
+    /// is set, the server refuses to start without it (see `init_environment`).
     pub local_token: Option<String>,
     /// Short-lived host-authentication key for built-in session MCP claims.
-    /// It is read and removed during synchronous pre-runtime bootstrap so
-    /// spawned user MCP processes cannot inherit it.
+    /// It is read from the same synchronous stdin envelope before any runtime
+    /// or spawned user MCP process exists.
     pub session_mcp_trust_key: Option<SessionMcpTrustKey>,
     /// Dump prompt diagnostics under `data_dir/prompt-dumps`.
     pub dump_prompts: bool,
