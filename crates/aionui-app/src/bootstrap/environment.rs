@@ -33,12 +33,13 @@ pub struct ServerEnvironment {
 /// Tokio or any command branch can create worker threads or child processes.
 pub(crate) struct PreRuntimeServerEnvironment {
     work_dir: std::path::PathBuf,
+    local_token: Option<String>,
     session_mcp_trust_key: Option<SessionMcpTrustKey>,
 }
 
-/// Scrub the trust authority from the process environment before runtime
-/// construction. Subcommands never consume the key or mutate the work-dir
-/// environment; the server branch receives the parsed value explicitly.
+/// Scrub server-only authentication authority from the process environment
+/// before runtime construction. Subcommands never consume these values or
+/// mutate the work-dir environment; the server branch receives them explicitly.
 pub(crate) fn prepare_pre_runtime_environment(
     cli: &Cli,
 ) -> Result<Option<PreRuntimeServerEnvironment>, BootstrapError> {
@@ -63,9 +64,11 @@ fn prepare_pre_runtime_environment_with(
     mut remove: impl FnMut(&str),
     mut set: impl FnMut(&str, &std::path::Path),
 ) -> Result<Option<PreRuntimeServerEnvironment>, BootstrapError> {
+    let local_token = read(LOCAL_TOKEN_ENV).filter(|value| !value.is_empty());
     let raw_trust_key = read(SESSION_MCP_TRUST_KEY_ENV);
-    // Remove before parsing or selecting a command so valid and malformed
-    // authority can never reach a later child-process environment.
+    // Remove both server-only authorities before parsing or selecting a command
+    // so valid and malformed values can never reach a later child process.
+    remove(LOCAL_TOKEN_ENV);
     remove(SESSION_MCP_TRUST_KEY_ENV);
 
     if cli.command.is_some() {
@@ -77,6 +80,7 @@ fn prepare_pre_runtime_environment_with(
     set("AIONUI_WORK_DIR", &work_dir);
     Ok(Some(PreRuntimeServerEnvironment {
         work_dir,
+        local_token,
         session_mcp_trust_key,
     }))
 }
@@ -103,7 +107,7 @@ pub fn init_environment(
     // token supplied by the desktop host via the `AIONUI_LOCAL_TOKEN` env var. In local
     // mode this token is MANDATORY — refuse to start without it rather than silently
     // reverting to an unauthenticated API that any local process could drive.
-    let local_token = std::env::var(LOCAL_TOKEN_ENV).ok().filter(|s| !s.is_empty());
+    let local_token = pre_runtime.local_token;
     if cli.local && local_token.is_none() {
         return Err(BootstrapError::new(
             BootstrapErrorCode::ConfigInvalid,
@@ -234,7 +238,9 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{SESSION_MCP_TRUST_KEY_ENV, parse_session_mcp_trust_key, prepare_pre_runtime_environment_with};
+    use super::{
+        LOCAL_TOKEN_ENV, SESSION_MCP_TRUST_KEY_ENV, parse_session_mcp_trust_key, prepare_pre_runtime_environment_with,
+    };
     use crate::cli::Cli;
 
     #[test]
@@ -253,8 +259,11 @@ mod tests {
     #[test]
     fn server_pre_runtime_scrubs_key_and_sets_work_dir_before_later_environment_reads() {
         let key = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI";
-        let environment =
-            std::cell::RefCell::new(HashMap::from([(SESSION_MCP_TRUST_KEY_ENV.to_owned(), key.to_owned())]));
+        let local_token = "local-token-1";
+        let environment = std::cell::RefCell::new(HashMap::from([
+            (LOCAL_TOKEN_ENV.to_owned(), local_token.to_owned()),
+            (SESSION_MCP_TRUST_KEY_ENV.to_owned(), key.to_owned()),
+        ]));
         let cli = Cli::try_parse_from(["aioncore", "--work-dir", "/tmp/aionui-pre-runtime"]).unwrap();
 
         let prepared = prepare_pre_runtime_environment_with(
@@ -271,7 +280,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(prepared.is_some());
+        assert_eq!(
+            prepared.as_ref().and_then(|value| value.local_token.as_deref()),
+            Some(local_token)
+        );
+        assert!(!environment.borrow().contains_key(LOCAL_TOKEN_ENV));
         assert!(!environment.borrow().contains_key(SESSION_MCP_TRUST_KEY_ENV));
         assert_eq!(
             environment.borrow().get("AIONUI_WORK_DIR").map(String::as_str),
@@ -281,10 +294,10 @@ mod tests {
 
     #[test]
     fn malformed_server_key_is_removed_before_error() {
-        let environment = std::cell::RefCell::new(HashMap::from([(
-            SESSION_MCP_TRUST_KEY_ENV.to_owned(),
-            "not+base64".to_owned(),
-        )]));
+        let environment = std::cell::RefCell::new(HashMap::from([
+            (LOCAL_TOKEN_ENV.to_owned(), "local-token-1".to_owned()),
+            (SESSION_MCP_TRUST_KEY_ENV.to_owned(), "not+base64".to_owned()),
+        ]));
         let cli = Cli::try_parse_from(["aioncore"]).unwrap();
 
         let result = prepare_pre_runtime_environment_with(
@@ -297,14 +310,17 @@ mod tests {
         );
 
         assert!(result.is_err());
+        assert!(!environment.borrow().contains_key(LOCAL_TOKEN_ENV));
         assert!(!environment.borrow().contains_key(SESSION_MCP_TRUST_KEY_ENV));
     }
 
     #[test]
     fn subcommands_scrub_and_discard_valid_or_malformed_key_without_setting_work_dir() {
         for raw in ["QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI", "not+base64"] {
-            let environment =
-                std::cell::RefCell::new(HashMap::from([(SESSION_MCP_TRUST_KEY_ENV.to_owned(), raw.to_owned())]));
+            let environment = std::cell::RefCell::new(HashMap::from([
+                (LOCAL_TOKEN_ENV.to_owned(), "local-token-1".to_owned()),
+                (SESSION_MCP_TRUST_KEY_ENV.to_owned(), raw.to_owned()),
+            ]));
             let cli =
                 Cli::try_parse_from(["aioncore", "--work-dir", "/tmp/must-not-be-exported", "capabilities"]).unwrap();
 
@@ -319,6 +335,7 @@ mod tests {
             .unwrap();
 
             assert!(prepared.is_none());
+            assert!(!environment.borrow().contains_key(LOCAL_TOKEN_ENV));
             assert!(!environment.borrow().contains_key(SESSION_MCP_TRUST_KEY_ENV));
             assert!(!environment.borrow().contains_key("AIONUI_WORK_DIR"));
         }
