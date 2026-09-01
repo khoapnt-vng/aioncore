@@ -1074,7 +1074,7 @@ mod tests {
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(applied_count, 28);
+        assert_eq!(applied_count, DB_MIGRATOR.iter().count() as i64);
         for migration in DB_MIGRATOR.iter() {
             let stored_checksum: Vec<u8> =
                 sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = ?")
@@ -1109,7 +1109,7 @@ mod tests {
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(applied_count, 28);
+        assert_eq!(applied_count, DB_MIGRATOR.iter().count() as i64);
         for migration in DB_MIGRATOR.iter() {
             let stored_checksum: Vec<u8> =
                 sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = ?")
