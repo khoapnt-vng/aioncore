@@ -1,19 +1,19 @@
 # Changelog
 
-## Unreleased
+## [0.1.55](https://github.com/khoapnt-vng/aioncore/compare/v0.1.54...v0.1.55) (2026-08-15)
+
+### Security
+
+- **mcp:** authenticate exact built-in session servers and bypass approval only for attested, read-only, non-destructive tools
+- **oauth:** fail closed when an expired MCP token cannot be safely refreshed and persist the issued OAuth client identity
 
 ### Bug Fixes
 
 - **db:** atomically normalize a verified Windows CRLF migration set, including databases partially aligned by WePrompt 2.1.40, without accepting mixed or unknown histories
 
-## [0.1.55](https://github.com/khoapnt-vng/aioncore/compare/v0.1.54...v0.1.55) (2026-08-15)
-
-### Security
-
-- **oauth:** fail closed when an expired MCP token cannot be safely refreshed and persist the issued OAuth client identity
-
 ### Build System
 
+- **dependencies:** pin the reviewed Aionrs MCP trust contract to an immutable revision
 - **release:** publish complete, checksummed macOS ARM64 and Windows x64 backend bundles with deterministic migration lineage
 
 ## [0.1.50](https://github.com/iOfficeAI/AionCore/compare/v0.1.49...v0.1.50) (2026-07-21)
