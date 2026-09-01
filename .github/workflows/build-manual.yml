@@ -17,11 +17,7 @@ on:
         type: choice
         options:
           - macos-arm64
-          - macos-x64
           - windows-x64
-          - windows-arm64
-          - linux-x64
-          - linux-arm64
           - all
         default: "macos-arm64"
 
@@ -33,10 +29,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_HTTP_TIMEOUT: "600"
   CARGO_NET_RETRY: "10"
-  # cross commit used by the v0.1.39/v0.1.40 Linux ARM64 release builds.
-  CROSS_GIT_REV: "29d00c7803f221f1b3f35e561b03792368fb8339"
-  LINUX_X64_GLIBC_MAX: "GLIBC_2.34"
-  LINUX_ARM64_GLIBC_MAX: "GLIBC_2.30"
 
 jobs:
   prepare-matrix:
@@ -52,29 +44,15 @@ jobs:
         run: |
           PLATFORM="${{ inputs.platform || 'internal-two-target' }}"
 
-          MACOS_ARM64='{"platform":"macos-arm64","os":"macos-latest","target":"aarch64-apple-darwin","binary_name":"aioncore","artifact_name":"aioncore-manual-macos-arm64","use_cross":false}'
-          MACOS_X64='{"platform":"macos-x64","os":"macos-latest","target":"x86_64-apple-darwin","binary_name":"aioncore","artifact_name":"aioncore-manual-macos-x64","use_cross":false}'
-          WINDOWS_X64='{"platform":"windows-x64","os":"windows-latest","target":"x86_64-pc-windows-msvc","binary_name":"aioncore.exe","artifact_name":"aioncore-manual-windows-x64","rustflags":"-C target-feature=+crt-static","use_cross":false}'
-          WINDOWS_ARM64='{"platform":"windows-arm64","os":"windows-latest","target":"aarch64-pc-windows-msvc","binary_name":"aioncore.exe","artifact_name":"aioncore-manual-windows-arm64","rustflags":"-C target-feature=+crt-static","use_cross":false}'
-          LINUX_X64='{"platform":"linux-x64","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","binary_name":"aioncore","artifact_name":"aioncore-manual-linux-x64","use_cross":false}'
-          LINUX_ARM64='{"platform":"linux-arm64","os":"ubuntu-latest","target":"aarch64-unknown-linux-gnu","binary_name":"aioncore","artifact_name":"aioncore-manual-linux-arm64","use_cross":true}'
+          MACOS_ARM64='{"platform":"macos-arm64","os":"macos-latest","target":"aarch64-apple-darwin","binary_name":"aioncore","artifact_name":"aioncore-manual-macos-arm64"}'
+          WINDOWS_X64='{"platform":"windows-x64","os":"windows-latest","target":"x86_64-pc-windows-msvc","binary_name":"aioncore.exe","artifact_name":"aioncore-manual-windows-x64","rustflags":"-C target-feature=+crt-static"}'
 
-          if [ "$PLATFORM" = "internal-two-target" ]; then
+          if [ "$PLATFORM" = "internal-two-target" ] || [ "$PLATFORM" = "all" ]; then
             MATRIX="{\"include\":[$MACOS_ARM64,$WINDOWS_X64]}"
-          elif [ "$PLATFORM" = "all" ]; then
-            MATRIX="{\"include\":[$MACOS_ARM64,$MACOS_X64,$WINDOWS_X64,$WINDOWS_ARM64,$LINUX_X64,$LINUX_ARM64]}"
           elif [ "$PLATFORM" = "macos-arm64" ]; then
             MATRIX="{\"include\":[$MACOS_ARM64]}"
-          elif [ "$PLATFORM" = "macos-x64" ]; then
-            MATRIX="{\"include\":[$MACOS_X64]}"
           elif [ "$PLATFORM" = "windows-x64" ]; then
             MATRIX="{\"include\":[$WINDOWS_X64]}"
-          elif [ "$PLATFORM" = "windows-arm64" ]; then
-            MATRIX="{\"include\":[$WINDOWS_ARM64]}"
-          elif [ "$PLATFORM" = "linux-x64" ]; then
-            MATRIX="{\"include\":[$LINUX_X64]}"
-          elif [ "$PLATFORM" = "linux-arm64" ]; then
-            MATRIX="{\"include\":[$LINUX_ARM64]}"
           fi
 
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
@@ -120,15 +98,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: manual-build-${{ matrix.target }}-${{ matrix.os }}${{ matrix.target == 'x86_64-unknown-linux-gnu' && format('-glibc-{0}', env.LINUX_X64_GLIBC_MAX) || '' }}${{ matrix.use_cross == true && format('-cross-{0}-glibc-{1}', env.CROSS_GIT_REV, env.LINUX_ARM64_GLIBC_MAX) || '' }}
-
-      - name: Verify pinned Linux ARM64 cross image is available
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: docker pull ghcr.io/cross-rs/aarch64-unknown-linux-gnu@sha256:99e041b94e7d4f31477c6ddede176688562c3762ba3833b75de3316100afc39d
-
-      - name: Install cross (Linux targets)
-        if: matrix.use_cross == true
-        run: cargo install cross --git https://github.com/cross-rs/cross --rev "${CROSS_GIT_REV}" --locked
+          shared-key: manual-build-${{ matrix.target }}-${{ matrix.os }}
 
       - name: Build release binary
         shell: bash
@@ -147,11 +117,7 @@ jobs:
             export OPENSSL_SRC_PERL="C:/Strawberry/perl/bin/perl.exe"
           fi
 
-          if [[ "${{ matrix.use_cross }}" == "true" ]]; then
-            cross build --release --target ${{ matrix.target }} -p aionui-app
-          else
-            cargo build --release --target ${{ matrix.target }} -p aionui-app
-          fi
+          cargo build --release --target ${{ matrix.target }} -p aionui-app
 
       - name: Prepare complete internal-test bundle
         shell: bash
@@ -187,16 +153,6 @@ jobs:
             --version 0.1.55 \
             --source-commit "${source_commit}" \
             --target "${{ matrix.target }}"
-
-      - name: Verify Linux ARM64 GLIBC baseline
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        shell: bash
-        run: scripts/check-glibc-baseline.sh "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "${LINUX_ARM64_GLIBC_MAX}"
-
-      - name: Verify Linux x64 GLIBC baseline
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        shell: bash
-        run: scripts/check-glibc-baseline.sh "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "${LINUX_X64_GLIBC_MAX}"
 
       - name: Package binary (Unix)
         if: runner.os != 'Windows'

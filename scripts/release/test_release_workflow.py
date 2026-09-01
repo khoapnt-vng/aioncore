@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 RELEASE_PATH = ROOT / ".github" / "workflows" / "release.yml"
 CI_PATH = ROOT / ".github" / "workflows" / "ci.yml"
 MANUAL_PATH = ROOT / ".github" / "workflows" / "build-manual.yml"
+GITATTRIBUTES_PATH = ROOT / ".gitattributes"
 APPROVED_TARGETS = {"aarch64-apple-darwin", "x86_64-pc-windows-msvc"}
 
 
@@ -21,6 +22,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         cls.ci = yaml.safe_load(cls.ci_text)
         cls.manual_text = MANUAL_PATH.read_text(encoding="utf-8")
         cls.manual = yaml.safe_load(cls.manual_text)
+        cls.gitattributes_text = GITATTRIBUTES_PATH.read_text(encoding="utf-8")
 
     def test_release_matrix_is_exactly_the_two_approved_native_targets(self):
         include = self.release["jobs"]["build"]["strategy"]["matrix"]["include"]
@@ -107,14 +109,41 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn('inputs.branch || github.sha', self.manual_text)
         self.assertIn('if [ "$PLATFORM" = "internal-two-target" ]', self.manual_text)
 
+    def test_manual_build_exposes_only_targets_with_complete_officecli_bundles(self):
+        self.assertIn("aarch64-apple-darwin", self.manual_text)
+        self.assertIn("x86_64-pc-windows-msvc", self.manual_text)
+        for unsupported in (
+            "x86_64-apple-darwin",
+            "aarch64-pc-windows-msvc",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+        ):
+            with self.subTest(unsupported=unsupported):
+                self.assertNotIn(unsupported, self.manual_text)
+
     def test_windows_disables_crlf_conversion_before_checkout(self):
-        steps = self.manual["jobs"]["build"]["steps"]
-        configure_index = next(
-            index for index, step in enumerate(steps) if step.get("name") == "Configure LF checkout on Windows"
+        for workflow_name, workflow in (("release", self.release), ("manual", self.manual)):
+            with self.subTest(workflow=workflow_name):
+                steps = workflow["jobs"]["build"]["steps"]
+                configure_index = next(
+                    index
+                    for index, step in enumerate(steps)
+                    if step.get("name") == "Configure LF checkout on Windows"
+                )
+                checkout_index = next(
+                    index
+                    for index, step in enumerate(steps)
+                    if step.get("uses", "").startswith("actions/checkout@")
+                )
+                self.assertLess(configure_index, checkout_index)
+                self.assertEqual(steps[configure_index].get("if"), "runner.os == 'Windows'")
+                self.assertIn("core.autocrlf false", steps[configure_index]["run"])
+
+    def test_migration_sql_is_pinned_to_lf(self):
+        self.assertIn(
+            "crates/aionui-db/migrations/*.sql text eol=lf",
+            self.gitattributes_text.splitlines(),
         )
-        checkout_index = next(index for index, step in enumerate(steps) if step.get("uses", "").startswith("actions/checkout@"))
-        self.assertLess(configure_index, checkout_index)
-        self.assertIn("core.autocrlf false", steps[configure_index]["run"])
 
     def test_workflow_has_no_force_or_overwrite_archive_path(self):
         forbidden = ["--force", "--clobber", "Compress-Archive -Force", "Remove-Item dist"]
