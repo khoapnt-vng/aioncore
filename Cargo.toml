@@ -202,3 +202,14 @@ incremental = false
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
 incremental = false
+
+# Temporary cross-repository integration pin for BUG-190.
+# Replace this patch with the official iOfficeAI/aionrs release tag after the
+# reviewed trust and permission contract lands upstream.
+[patch."https://github.com/iOfficeAI/aionrs.git"]
+aion-agent = { git = "https://github.com/minhtq1234/aionrs.git", rev = "2cdbb8f5afd50637d9f7fc80941592403ddbe345" }
+aion-config = { git = "https://github.com/minhtq1234/aionrs.git", rev = "2cdbb8f5afd50637d9f7fc80941592403ddbe345" }
+aion-mcp = { git = "https://github.com/minhtq1234/aionrs.git", rev = "2cdbb8f5afd50637d9f7fc80941592403ddbe345" }
+aion-protocol = { git = "https://github.com/minhtq1234/aionrs.git", rev = "2cdbb8f5afd50637d9f7fc80941592403ddbe345" }
+aion-providers = { git = "https://github.com/minhtq1234/aionrs.git", rev = "2cdbb8f5afd50637d9f7fc80941592403ddbe345" }
+aion-types = { git = "https://github.com/minhtq1234/aionrs.git", rev = "2cdbb8f5afd50637d9f7fc80941592403ddbe345" }
