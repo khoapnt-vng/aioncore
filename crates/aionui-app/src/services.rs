@@ -10,7 +10,9 @@ use aionui_ai_agent::{
 };
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
-use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
+use aionui_conversation::{
+    ConversationService, SessionMcpTrustAuthority, runtime_state::ConversationRuntimeStateService,
+};
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
     IOAuthTokenRepository, ISkillRepository, IUserRepository, SqliteAcpSessionRepository,
@@ -33,6 +35,10 @@ pub struct AppServices {
     pub runtime_token_service: Arc<RuntimeTokenService>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
+    /// Verifies and consumes main-process-authenticated session MCP claims.
+    /// Shared across service rebuilds so a nonce cannot be replayed by swapping
+    /// the worker task manager in tests or during composition.
+    session_mcp_trust_authority: Option<Arc<SessionMcpTrustAuthority>>,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -92,6 +98,7 @@ impl AppServices {
             runtime_helper_bin: self.runtime_helper_bin.clone(),
             runtime_base_url: self.runtime_base_url.clone(),
             runtime_token_service: self.runtime_token_service.clone(),
+            session_mcp_trust_authority: self.session_mcp_trust_authority.clone(),
         });
         self
     }
@@ -103,6 +110,10 @@ impl AppServices {
         let local_token: Option<Arc<str>> = config.local_token.as_deref().map(Arc::from);
         let dump_prompts = config.dump_prompts;
         let app_version = config.app_version.clone();
+        let session_mcp_trust_authority = config
+            .session_mcp_trust_key
+            .as_ref()
+            .map(|key| Arc::new(SessionMcpTrustAuthority::new(key.expose())));
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
 
         // Resolve JWT secret: env var → system user db field → random generation
@@ -220,6 +231,7 @@ impl AppServices {
             runtime_helper_bin: runtime_helper_bin.clone(),
             runtime_base_url: runtime_base_url.clone(),
             runtime_token_service: runtime_token_service.clone(),
+            session_mcp_trust_authority: session_mcp_trust_authority.clone(),
         });
 
         Ok(Self {
@@ -235,6 +247,7 @@ impl AppServices {
             runtime_token_service,
             conversation_runtime_state,
             conversation_service,
+            session_mcp_trust_authority,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,
@@ -268,6 +281,7 @@ struct ConversationServiceDeps<'a> {
     runtime_helper_bin: String,
     runtime_base_url: String,
     runtime_token_service: Arc<RuntimeTokenService>,
+    session_mcp_trust_authority: Option<Arc<SessionMcpTrustAuthority>>,
 }
 
 fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
@@ -286,7 +300,8 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     )
     .with_runtime_state(deps.conversation_runtime_state)
     .with_runtime_helper_context(deps.runtime_helper_bin, deps.runtime_base_url)
-    .with_runtime_token_service(deps.runtime_token_service);
+    .with_runtime_token_service(deps.runtime_token_service)
+    .with_session_mcp_trust_authority(deps.session_mcp_trust_authority);
     service.with_mcp_server_repo(Arc::new(SqliteMcpServerRepository::new(deps.database.pool().clone())));
     service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(
         deps.database.pool().clone(),
@@ -348,6 +363,20 @@ mod tests {
         let services = AppServices::from_config(db, &config).await.unwrap();
 
         assert_eq!(services.app_version, "9.9.9");
+
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_app_services_builds_session_mcp_trust_authority_from_bootstrap_key() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let config = AppConfig {
+            session_mcp_trust_key: Some(crate::config::SessionMcpTrustKey::new([0x42; 32])),
+            ..Default::default()
+        };
+        let services = AppServices::from_config(db, &config).await.unwrap();
+
+        assert!(services.session_mcp_trust_authority.is_some());
 
         services.database.close().await;
     }

@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "minimumSupportedVersion": 19,
-  "latestVersion": 28,
-  "entryCount": 28,
-  "fingerprint": "3d872b4b1346afde6e277dd727e87af3ca140c91d7da16590ab272af7b3561e3",
+  "latestVersion": 29,
+  "entryCount": 29,
+  "fingerprint": "5bfe0786fe7010ca3ae87638617c0bcf72572e010a166b65cbf5e37304057a82",
   "entries": [
     {
       "version": 1,
@@ -172,6 +172,12 @@
       "description": "oauth token client id",
       "filename": "028_oauth_token_client_id.sql",
       "checksum": "d7deb7bd13c8654bf04671e7588167ee0006cadf4760ac903bfd6ff6976e92b5736bd8157c7acc5416687b30abbe0ca7"
+    },
+    {
+      "version": 29,
+      "description": "verified session mcp trust",
+      "filename": "029_verified_session_mcp_trust.sql",
+      "checksum": "e55424b84033ebf5171bc6ccb96d2c6e5edd27d38c736bde96862a30ceeb7a776a243cee1a1d6b9e89ed1ee337937753"
     }
   ]
 }

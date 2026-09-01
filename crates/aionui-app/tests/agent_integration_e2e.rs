@@ -529,6 +529,7 @@ async fn confirm_and_check_approval() {
         action: Some("test_action".into()),
         description: String::new(),
         command_type: None,
+        mcp_identity: None,
         options: vec![],
     });
 

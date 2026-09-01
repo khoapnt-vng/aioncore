@@ -8,7 +8,7 @@ use aionui_ai_agent::session_context::{
 };
 use aionui_ai_agent::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, PersistedSessionState};
 use aionui_ai_agent::types::BuildTaskOptions;
-use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra, TeamSessionBinding};
+use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra, SessionMcpTrustSnapshot, TeamSessionBinding};
 use aionui_common::{AgentType, WorkspacePathValidationError, validate_workspace_path_availability};
 use aionui_db::models::ConversationRow;
 use aionui_db::{IAcpSessionRepository, IAgentMetadataRepository};
@@ -45,9 +45,11 @@ impl<'a> SessionContextBuilder<'a> {
         &self,
         row: &ConversationRow,
         seed: Option<AionrsRuntimePermissionSeed>,
+        verified_session_mcp_trust: Vec<SessionMcpTrustSnapshot>,
     ) -> Result<BuildTaskOptions, ConversationError> {
         Ok(BuildTaskOptions::new(
-            self.build_with_workspace_override(row, None, seed).await?,
+            self.build_with_workspace_override(row, None, seed, verified_session_mcp_trust)
+                .await?,
         ))
     }
 
@@ -56,9 +58,10 @@ impl<'a> SessionContextBuilder<'a> {
         row: &ConversationRow,
         workspace_override: Option<&str>,
         seed: Option<AionrsRuntimePermissionSeed>,
+        verified_session_mcp_trust: Vec<SessionMcpTrustSnapshot>,
     ) -> Result<BuildTaskOptions, ConversationError> {
         Ok(BuildTaskOptions::new(
-            self.build_with_workspace_override(row, workspace_override, seed)
+            self.build_with_workspace_override(row, workspace_override, seed, verified_session_mcp_trust)
                 .await?,
         ))
     }
@@ -68,7 +71,7 @@ impl<'a> SessionContextBuilder<'a> {
     /// (no-seed) path.
     #[cfg(test)]
     async fn build(&self, row: &ConversationRow) -> Result<AgentSessionContext, ConversationError> {
-        self.build_with_workspace_override(row, None, None).await
+        self.build_with_workspace_override(row, None, None, Vec::new()).await
     }
 
     async fn build_with_workspace_override(
@@ -76,6 +79,7 @@ impl<'a> SessionContextBuilder<'a> {
         row: &ConversationRow,
         workspace_override: Option<&str>,
         seed: Option<AionrsRuntimePermissionSeed>,
+        verified_session_mcp_trust: Vec<SessionMcpTrustSnapshot>,
     ) -> Result<AgentSessionContext, ConversationError> {
         let agent_type: AgentType = string_to_enum(&row.r#type)?;
         reject_deprecated_runtime_kind(row, &agent_type)?;
@@ -86,7 +90,9 @@ impl<'a> SessionContextBuilder<'a> {
         let team = TeamSessionBinding::from_extra_value(&extra).map_err(|e| ConversationError::BadRequest {
             reason: format!("Invalid Team runtime context: {e}"),
         })?;
-        let kind = self.build_kind(row, &agent_type, extra, team.clone(), seed).await?;
+        let kind = self
+            .build_kind(row, &agent_type, extra, team.clone(), seed, verified_session_mcp_trust)
+            .await?;
 
         Ok(AgentSessionContext {
             conversation: ConversationContext {
@@ -176,6 +182,7 @@ impl<'a> SessionContextBuilder<'a> {
         extra: serde_json::Value,
         team: Option<TeamSessionBinding>,
         seed: Option<AionrsRuntimePermissionSeed>,
+        verified_session_mcp_trust: Vec<SessionMcpTrustSnapshot>,
     ) -> Result<AgentSessionKind, ConversationError> {
         match agent_type {
             AgentType::Acp => self
@@ -183,7 +190,11 @@ impl<'a> SessionContextBuilder<'a> {
                 .await
                 .map(|context| AgentSessionKind::Acp(Box::new(context))),
             AgentType::Aionrs => Ok(AgentSessionKind::Aionrs(Box::new(build_aionrs_context(
-                row, extra, team, seed,
+                row,
+                extra,
+                team,
+                seed,
+                verified_session_mcp_trust,
             )))),
             AgentType::Gemini
             | AgentType::Codex
@@ -372,6 +383,7 @@ fn build_aionrs_context(
     extra: serde_json::Value,
     team: Option<TeamSessionBinding>,
     permission_seed: Option<AionrsRuntimePermissionSeed>,
+    verified_session_mcp_trust: Vec<SessionMcpTrustSnapshot>,
 ) -> AionrsSessionBuildContext {
     let mut config: AionrsBuildExtra = match serde_json::from_value(extra.clone()) {
         Ok(config) => config,
@@ -384,6 +396,10 @@ fn build_aionrs_context(
             AionrsBuildExtra::default()
         }
     };
+    // `conversation.extra` is caller-shaped historical storage. Never accept
+    // a trust-looking value from it; only the strictly decoded private column
+    // supplied by ConversationService can authorize a runtime server.
+    config.session_mcp_trust = verified_session_mcp_trust;
     config.user_id.get_or_insert_with(|| row.user_id.clone());
     apply_team_seed_to_aionrs_config(&team, &mut config);
     let belongs_to_team = team.is_some();
@@ -1133,6 +1149,7 @@ mod tests {
             serde_json::json!({ "session_mode": "default" }),
             None,
             Some(aionrs_seed("auto", Some("yolo"))),
+            Vec::new(),
         );
         assert_eq!(ctx.config.session_mode.as_deref(), Some("yolo"));
     }
@@ -1146,6 +1163,7 @@ mod tests {
             serde_json::json!({ "session_mode": "auto_edit" }),
             None,
             Some(aionrs_seed("auto", Some("yolo"))),
+            Vec::new(),
         );
         assert_eq!(ctx.config.session_mode.as_deref(), Some("yolo"));
     }
@@ -1159,6 +1177,7 @@ mod tests {
             serde_json::json!({ "session_mode": "default" }),
             None,
             Some(aionrs_seed("fixed", Some("yolo"))),
+            Vec::new(),
         );
         assert_eq!(ctx.config.session_mode.as_deref(), Some("default"));
     }
@@ -1179,6 +1198,7 @@ mod tests {
             serde_json::json!({ "session_mode": "auto_edit" }),
             team,
             Some(aionrs_seed("auto", Some("yolo"))),
+            Vec::new(),
         );
         assert_eq!(ctx.config.session_mode.as_deref(), Some("auto_edit"));
     }

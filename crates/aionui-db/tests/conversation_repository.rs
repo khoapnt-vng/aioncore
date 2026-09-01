@@ -1013,6 +1013,44 @@ async fn update_extra_replaces_json() {
 }
 
 #[tokio::test]
+async fn verified_session_mcp_trust_is_private_and_immutable_through_row_updates() {
+    let (repo, _db) = setup().await;
+    let ordinary = make_conversation("ordinary-private-trust");
+    repo.create(&ordinary).await.unwrap();
+    assert!(
+        repo.get_verified_session_mcp_trust(&ordinary.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let trusted = make_conversation("verified-private-trust");
+    let private_snapshot = r#"[{"server_id":"studio-1","server_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","resolver_profile":"aioncore.session-mcp-resolver.v1"}]"#;
+    repo.create_with_verified_session_mcp_trust(&trusted, Some(private_snapshot))
+        .await
+        .unwrap();
+
+    repo.update(
+        &trusted.id,
+        &ConversationRowUpdate {
+            extra: Some(r#"{"session_mcp_trust":[{"server_id":"forged"}]}"#.into()),
+            updated_at: Some(aionui_common::now_ms()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        repo.get_verified_session_mcp_trust(&trusted.id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(private_snapshot)
+    );
+}
+
+#[tokio::test]
 async fn get_messages_excludes_legacy_cron_and_skill_suggest_rows() {
     let (repo, _db) = setup().await;
     let conv = make_conversation("message-filter");

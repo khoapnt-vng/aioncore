@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::TeamMcpStdioConfig;
 
@@ -36,6 +37,90 @@ pub struct SessionMcpServer {
     pub id: String,
     pub name: String,
     pub transport: SessionMcpTransport,
+}
+
+const SESSION_MCP_FINGERPRINT_DOMAIN: &[u8] = b"aionui.session-mcp.identity.v1\0";
+/// Bump whenever Core changes how a persisted logical session descriptor is
+/// resolved into the executable/network config passed to Aionrs.
+pub const SESSION_MCP_RESOLVER_PROFILE_V1: &str = "aioncore.session-mcp-resolver.v1";
+
+/// Fingerprint the exact logical executable/network descriptor supplied by
+/// the host without relying on map iteration order or cross-language JSON
+/// canonicalization. A separate Core-owned resolver profile records how that
+/// logical descriptor is interpreted at runtime.
+pub fn session_mcp_server_fingerprint(server: &SessionMcpServer) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(SESSION_MCP_FINGERPRINT_DOMAIN);
+    fingerprint_string(&mut hasher, &server.id);
+    fingerprint_string(&mut hasher, &server.name);
+    match &server.transport {
+        SessionMcpTransport::Stdio { command, args, env } => {
+            fingerprint_string(&mut hasher, "stdio");
+            fingerprint_string(&mut hasher, command);
+            fingerprint_count(&mut hasher, args.len());
+            for arg in args {
+                fingerprint_string(&mut hasher, arg);
+            }
+            fingerprint_map(&mut hasher, env);
+        }
+        SessionMcpTransport::Http { url, headers } => {
+            fingerprint_string(&mut hasher, "http");
+            fingerprint_string(&mut hasher, url);
+            fingerprint_map(&mut hasher, headers);
+        }
+        SessionMcpTransport::Sse { url, headers } => {
+            fingerprint_string(&mut hasher, "sse");
+            fingerprint_string(&mut hasher, url);
+            fingerprint_map(&mut hasher, headers);
+        }
+        SessionMcpTransport::StreamableHttp { url, headers } => {
+            fingerprint_string(&mut hasher, "streamable_http");
+            fingerprint_string(&mut hasher, url);
+            fingerprint_map(&mut hasher, headers);
+        }
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn fingerprint_string(hasher: &mut Sha256, value: &str) {
+    let bytes = value.as_bytes();
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn fingerprint_count(hasher: &mut Sha256, count: usize) {
+    hasher.update((count as u64).to_be_bytes());
+}
+
+fn fingerprint_map(hasher: &mut Sha256, values: &HashMap<String, String>) {
+    let mut entries: Vec<_> = values.iter().collect();
+    entries.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+    fingerprint_count(hasher, entries.len());
+    for (key, value) in entries {
+        fingerprint_string(hasher, key);
+        fingerprint_string(hasher, value);
+    }
+}
+
+/// Short-lived host authentication supplied only while a session MCP snapshot
+/// is created. The backend verifies and consumes this envelope before
+/// persisting the conversation; it must never be stored as runtime authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMcpTrustClaim {
+    pub payload: String,
+    pub signature: String,
+}
+
+/// Backend-owned record proving which logical session MCP descriptor the
+/// desktop host authenticated and which exact Core resolver policy may
+/// interpret it at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMcpTrustSnapshot {
+    pub server_id: String,
+    pub server_fingerprint: String,
+    pub resolver_profile: String,
 }
 
 /// ACP-specific fields extracted from `extra` in build task options.
@@ -98,6 +183,11 @@ pub struct AionrsBuildExtra {
     pub mcp_server_ids: Option<Vec<String>>,
     #[serde(default)]
     pub session_mcp_servers: Vec<SessionMcpServer>,
+    /// Runtime-only projection loaded from AionCore's private verified column.
+    /// Conversation assembly must overwrite any caller-shaped value, including
+    /// an empty private result, before this reaches the factory.
+    #[serde(default)]
+    pub session_mcp_trust: Vec<SessionMcpTrustSnapshot>,
     #[serde(default)]
     pub backend: Option<String>,
     #[serde(default)]

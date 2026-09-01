@@ -126,6 +126,7 @@ fn aionrs_final_input_dump_value_contains_raw_split_input_and_context() {
     mcp_servers.insert(
         "raw-mcp".to_owned(),
         McpServerConfig {
+            trust: aion_config::config::McpServerTrust::Untrusted,
             transport: TransportType::Stdio,
             command: Some("/bin/raw-mcp".to_owned()),
             args: Some(vec!["--serve".to_owned()]),

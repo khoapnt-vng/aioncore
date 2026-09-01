@@ -192,6 +192,49 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(())
     }
 
+    async fn create_with_verified_session_mcp_trust(
+        &self,
+        row: &ConversationRow,
+        verified_session_mcp_trust: Option<&str>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO conversations \
+                (id, user_id, name, type, extra, model, status, source, \
+                 channel_chat_id, pinned, pinned_at, created_at, updated_at, verified_session_mcp_trust) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.user_id)
+        .bind(&row.name)
+        .bind(&row.r#type)
+        .bind(&row.extra)
+        .bind(&row.model)
+        .bind(&row.status)
+        .bind(&row.source)
+        .bind(&row.channel_chat_id)
+        .bind(row.pinned)
+        .bind(row.pinned_at)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .bind(verified_session_mcp_trust)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn get_verified_session_mcp_trust(&self, id: &str) -> Result<Option<String>, DbError> {
+        let value = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT verified_session_mcp_trust FROM conversations WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+
+        Ok(value)
+    }
+
     async fn update(&self, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError> {
         // Build dynamic SET clause
         let mut set_parts: Vec<String> = Vec::new();

@@ -2,9 +2,12 @@
 
 use std::time::Instant;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use tracing::info;
 
-use aionui_app::AppConfig;
+use aionui_app::{AppConfig, SessionMcpTrustKey};
+use aionui_conversation::SESSION_MCP_TRUST_KEY_ENV;
 use aionui_db::Database;
 
 use crate::cli::Cli;
@@ -26,11 +29,67 @@ pub struct ServerEnvironment {
     pub config: AppConfig,
 }
 
+/// Sensitive server-only values resolved and scrubbed synchronously before
+/// Tokio or any command branch can create worker threads or child processes.
+pub(crate) struct PreRuntimeServerEnvironment {
+    work_dir: std::path::PathBuf,
+    session_mcp_trust_key: Option<SessionMcpTrustKey>,
+}
+
+/// Scrub the trust authority from the process environment before runtime
+/// construction. Subcommands never consume the key or mutate the work-dir
+/// environment; the server branch receives the parsed value explicitly.
+pub(crate) fn prepare_pre_runtime_environment(
+    cli: &Cli,
+) -> Result<Option<PreRuntimeServerEnvironment>, BootstrapError> {
+    prepare_pre_runtime_environment_with(
+        cli,
+        |name| std::env::var(name).ok(),
+        |name| {
+            // SAFETY: run_main calls this synchronously before constructing
+            // Tokio or entering any command branch.
+            unsafe { std::env::remove_var(name) };
+        },
+        |name, value| {
+            // SAFETY: same pre-runtime boundary as the removal above.
+            unsafe { std::env::set_var(name, value) };
+        },
+    )
+}
+
+fn prepare_pre_runtime_environment_with(
+    cli: &Cli,
+    mut read: impl FnMut(&str) -> Option<String>,
+    mut remove: impl FnMut(&str),
+    mut set: impl FnMut(&str, &std::path::Path),
+) -> Result<Option<PreRuntimeServerEnvironment>, BootstrapError> {
+    let raw_trust_key = read(SESSION_MCP_TRUST_KEY_ENV);
+    // Remove before parsing or selecting a command so valid and malformed
+    // authority can never reach a later child-process environment.
+    remove(SESSION_MCP_TRUST_KEY_ENV);
+
+    if cli.command.is_some() {
+        return Ok(None);
+    }
+
+    let session_mcp_trust_key = parse_session_mcp_trust_key(raw_trust_key)?;
+    let work_dir = resolve_work_dir(cli.work_dir.clone(), &cli.data_dir);
+    set("AIONUI_WORK_DIR", &work_dir);
+    Ok(Some(PreRuntimeServerEnvironment {
+        work_dir,
+        session_mcp_trust_key,
+    }))
+}
+
 /// Layer 1: Logging + config resolution.
 ///
 /// Cheap, synchronous, no IO beyond creating the log directory.
 /// All subcommands that need logging and config should call this first.
-pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironment, BootstrapError> {
+pub fn init_environment(
+    cli: &Cli,
+    merged_path: &str,
+    pre_runtime: PreRuntimeServerEnvironment,
+) -> Result<ServerEnvironment, BootstrapError> {
     let log_dir = cli.log_dir.clone().unwrap_or_else(|| cli.data_dir.join("logs"));
     let log_guard = init_tracing(&log_dir, cli.log_level.as_deref())?;
 
@@ -39,13 +98,6 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         path_len = merged_path.len(),
         "startup: PATH ready"
     );
-
-    let work_dir = resolve_work_dir(cli.work_dir.clone(), &cli.data_dir);
-
-    // SAFETY: called before any service initialization; no concurrent reads.
-    unsafe {
-        std::env::set_var("AIONUI_WORK_DIR", &work_dir);
-    }
 
     // SECURITY (D-01): the embedded local API is protected by a per-session loopback
     // token supplied by the desktop host via the `AIONUI_LOCAL_TOKEN` env var. In local
@@ -64,10 +116,11 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         host: cli.host.clone(),
         port: cli.port,
         data_dir: cli.data_dir.clone(),
-        work_dir,
+        work_dir: pre_runtime.work_dir,
         app_version: cli.app_version.clone(),
         local: cli.local,
         local_token,
+        session_mcp_trust_key: pre_runtime.session_mcp_trust_key,
         dump_prompts: cli.dump_prompts,
         recover_corrupted_database: cli.recover_corrupted_database,
     };
@@ -82,6 +135,31 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         _log_guard: log_guard,
         config,
     })
+}
+
+fn invalid_session_mcp_trust_key() -> BootstrapError {
+    BootstrapError::new(
+        BootstrapErrorCode::ConfigInvalid,
+        "config.session_mcp_trust_key",
+        "session MCP trust key must be canonical unpadded base64url containing exactly 32 bytes",
+    )
+}
+
+fn parse_session_mcp_trust_key(raw: Option<String>) -> Result<Option<SessionMcpTrustKey>, BootstrapError> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    if value.is_empty() || value.contains('=') {
+        return Err(invalid_session_mcp_trust_key());
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(&value)
+        .map_err(|_| invalid_session_mcp_trust_key())?;
+    if decoded.len() != 32 || URL_SAFE_NO_PAD.encode(&decoded) != value {
+        return Err(invalid_session_mcp_trust_key());
+    }
+    let bytes: [u8; 32] = decoded.try_into().map_err(|_| invalid_session_mcp_trust_key())?;
+    Ok(Some(SessionMcpTrustKey::new(bytes)))
 }
 
 /// Layer 2: Materialize builtin skills + initialize the database.
@@ -152,6 +230,100 @@ pub async fn init_data_layer(config: &AppConfig) -> Result<Database, BootstrapEr
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use clap::Parser;
+
+    use super::{SESSION_MCP_TRUST_KEY_ENV, parse_session_mcp_trust_key, prepare_pre_runtime_environment_with};
+    use crate::cli::Cli;
+
+    #[test]
+    fn session_mcp_trust_key_requires_canonical_32_byte_base64url() {
+        let key = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI";
+        assert!(parse_session_mcp_trust_key(Some(key.into())).unwrap().is_some());
+        assert!(parse_session_mcp_trust_key(None).unwrap().is_none());
+        for malformed in ["", "abc=", "not+base64", "AQ"] {
+            assert!(
+                parse_session_mcp_trust_key(Some(malformed.into())).is_err(),
+                "{malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_pre_runtime_scrubs_key_and_sets_work_dir_before_later_environment_reads() {
+        let key = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI";
+        let environment =
+            std::cell::RefCell::new(HashMap::from([(SESSION_MCP_TRUST_KEY_ENV.to_owned(), key.to_owned())]));
+        let cli = Cli::try_parse_from(["aioncore", "--work-dir", "/tmp/aionui-pre-runtime"]).unwrap();
+
+        let prepared = prepare_pre_runtime_environment_with(
+            &cli,
+            |name| environment.borrow().get(name).cloned(),
+            |name| {
+                environment.borrow_mut().remove(name);
+            },
+            |name, value| {
+                environment
+                    .borrow_mut()
+                    .insert(name.to_owned(), value.to_string_lossy().into_owned());
+            },
+        )
+        .unwrap();
+
+        assert!(prepared.is_some());
+        assert!(!environment.borrow().contains_key(SESSION_MCP_TRUST_KEY_ENV));
+        assert_eq!(
+            environment.borrow().get("AIONUI_WORK_DIR").map(String::as_str),
+            Some("/tmp/aionui-pre-runtime")
+        );
+    }
+
+    #[test]
+    fn malformed_server_key_is_removed_before_error() {
+        let environment = std::cell::RefCell::new(HashMap::from([(
+            SESSION_MCP_TRUST_KEY_ENV.to_owned(),
+            "not+base64".to_owned(),
+        )]));
+        let cli = Cli::try_parse_from(["aioncore"]).unwrap();
+
+        let result = prepare_pre_runtime_environment_with(
+            &cli,
+            |name| environment.borrow().get(name).cloned(),
+            |name| {
+                environment.borrow_mut().remove(name);
+            },
+            |_name, _value| panic!("malformed key must fail before work-dir mutation"),
+        );
+
+        assert!(result.is_err());
+        assert!(!environment.borrow().contains_key(SESSION_MCP_TRUST_KEY_ENV));
+    }
+
+    #[test]
+    fn subcommands_scrub_and_discard_valid_or_malformed_key_without_setting_work_dir() {
+        for raw in ["QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI", "not+base64"] {
+            let environment =
+                std::cell::RefCell::new(HashMap::from([(SESSION_MCP_TRUST_KEY_ENV.to_owned(), raw.to_owned())]));
+            let cli =
+                Cli::try_parse_from(["aioncore", "--work-dir", "/tmp/must-not-be-exported", "capabilities"]).unwrap();
+
+            let prepared = prepare_pre_runtime_environment_with(
+                &cli,
+                |name| environment.borrow().get(name).cloned(),
+                |name| {
+                    environment.borrow_mut().remove(name);
+                },
+                |_name, _value| panic!("subcommands must not mutate AIONUI_WORK_DIR"),
+            )
+            .unwrap();
+
+            assert!(prepared.is_none());
+            assert!(!environment.borrow().contains_key(SESSION_MCP_TRUST_KEY_ENV));
+            assert!(!environment.borrow().contains_key("AIONUI_WORK_DIR"));
+        }
+    }
+
     #[test]
     fn database_stage_comes_from_db_boundary_error() {
         let err = aionui_db::DatabaseInitError::new(

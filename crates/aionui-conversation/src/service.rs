@@ -14,6 +14,7 @@ use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
+use crate::session_mcp_trust::{SessionMcpTrustAuthority, decode_verified_session_mcp_trust};
 use aionui_api_types::{
     ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CloneConversationRequest,
     ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
@@ -21,8 +22,9 @@ use aionui_api_types::{
     ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
     EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
     MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest,
-    WebSocketMessage, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
+    SessionMcpTransport, SessionMcpTrustClaim, SessionMcpTrustSnapshot, TeamSessionBinding,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
+    assistant_avatar_response_value_with_version,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
@@ -47,7 +49,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::convert::{
     TOOL_CONTENT_COMPACT_THRESHOLD_BYTES, row_to_artifact_response, row_to_message_response,
-    row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item, string_to_enum,
+    row_to_message_response_compact, row_to_response_with_extra_and_verified_trust, search_row_to_item, string_to_enum,
 };
 use crate::error::ConversationError;
 use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
@@ -322,6 +324,7 @@ pub struct ConversationService {
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
+    session_mcp_trust_authority: Option<Arc<SessionMcpTrustAuthority>>,
 
     // Repos for conversation, acp_session and agent_metadata access.
     conversation_repo: Arc<dyn IConversationRepository>,
@@ -369,6 +372,27 @@ pub struct ConversationAgentTurnOutcome {
 // ── Construction & Dependency Injection ──────────────────────────────
 
 impl ConversationService {
+    async fn load_verified_session_mcp_trust(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<SessionMcpTrustSnapshot>, ConversationError> {
+        let raw = self
+            .conversation_repo
+            .get_verified_session_mcp_trust(conversation_id)
+            .await?;
+        match decode_verified_session_mcp_trust(raw.as_deref()) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                warn!(
+                    conversation_id,
+                    diagnostic_class = error.diagnostic_class(),
+                    "Ignoring invalid private session MCP trust snapshot"
+                );
+                Ok(Vec::new())
+            }
+        }
+    }
+
     pub fn new(
         workspace_root: PathBuf,
         broadcaster: Arc<dyn EventBroadcaster>,
@@ -395,6 +419,7 @@ impl ConversationService {
             runtime_helper_bin: None,
             runtime_base_url: None,
             runtime_token_service: None,
+            session_mcp_trust_authority: None,
 
             conversation_repo,
             agent_metadata_repo,
@@ -415,6 +440,11 @@ impl ConversationService {
 
     pub fn with_runtime_token_service(mut self, runtime_token_service: Arc<RuntimeTokenService>) -> Self {
         self.runtime_token_service = Some(runtime_token_service);
+        self
+    }
+
+    pub fn with_session_mcp_trust_authority(mut self, authority: Option<Arc<SessionMcpTrustAuthority>>) -> Self {
+        self.session_mcp_trust_authority = authority;
         self
     }
 
@@ -759,6 +789,75 @@ impl ConversationService {
             warn!("aionrs create: stripped legacy `extra.model`; top-level `model` is canonical");
         }
 
+        // Authenticate transient host claims before filesystem or database
+        // side effects. Caller-shaped extra can contain an old or forged
+        // `session_mcp_trust`; it is always discarded and never consulted.
+        let selected_session_mcp_trust_claims = match extra.as_object_mut() {
+            Some(obj) => {
+                obj.remove("session_mcp_trust");
+                match obj.remove("selected_session_mcp_trust_claims") {
+                    Some(value) => serde_json::from_value::<Vec<SessionMcpTrustClaim>>(value).map_err(|_| {
+                        ConversationError::BadRequest {
+                            reason: "Invalid selected_session_mcp_trust_claims".into(),
+                        }
+                    })?,
+                    None => Vec::new(),
+                }
+            }
+            None => Vec::new(),
+        };
+        let selected_session_mcp_servers = match extra.as_object_mut() {
+            Some(obj) => match obj.remove("selected_session_mcp_servers") {
+                Some(value) => Some(serde_json::from_value::<Vec<SessionMcpServer>>(value).map_err(|e| {
+                    ConversationError::BadRequest {
+                        reason: format!("Invalid selected_session_mcp_servers: {e}"),
+                    }
+                })?),
+                None => None,
+            },
+            None => None,
+        };
+        let session_mcp_trust: Vec<SessionMcpTrustSnapshot> = if selected_session_mcp_trust_claims.is_empty() {
+            Vec::new()
+        } else {
+            if effective_type != AgentType::Aionrs {
+                return Err(ConversationError::BadRequest {
+                    reason: "Session MCP trust claims are only accepted for Aionrs conversations".into(),
+                });
+            }
+            let Some(authority) = self.session_mcp_trust_authority.as_ref() else {
+                warn!(
+                    conversation_id = %id,
+                    diagnostic_class = "authority_unavailable",
+                    "Rejected session MCP trust claim"
+                );
+                return Err(ConversationError::BadRequest {
+                    reason: "Session MCP trust claim rejected".into(),
+                });
+            };
+            let servers = selected_session_mcp_servers.as_deref().unwrap_or_default();
+            match authority.authenticate_claims(&selected_session_mcp_trust_claims, servers, now_ms()) {
+                Ok(trust) => {
+                    info!(
+                        conversation_id = %id,
+                        trusted_server_count = trust.len(),
+                        "Authenticated session MCP server snapshot"
+                    );
+                    trust
+                }
+                Err(error) => {
+                    warn!(
+                        conversation_id = %id,
+                        diagnostic_class = error.diagnostic_class(),
+                        "Rejected session MCP trust claim"
+                    );
+                    return Err(ConversationError::BadRequest {
+                        reason: "Session MCP trust claim rejected".into(),
+                    });
+                }
+            }
+        };
+
         // Determine whether the user chose this workspace ("custom") or we
         // auto-provision one under
         // `{data_dir}/conversations/YYYY/MM/DD/{label}-temp-{id}/`.
@@ -999,18 +1098,6 @@ impl ConversationService {
             }
             None => None,
         };
-        let selected_session_mcp_servers = match extra.as_object_mut() {
-            Some(obj) => match obj.remove("selected_session_mcp_servers") {
-                Some(value) => Some(serde_json::from_value::<Vec<SessionMcpServer>>(value).map_err(|e| {
-                    ConversationError::BadRequest {
-                        reason: format!("Invalid selected_session_mcp_servers: {e}"),
-                    }
-                })?),
-                None => None,
-            },
-            None => None,
-        };
-
         let mcp_support = self.resolve_mcp_support_policy(&effective_type, &extra).await?;
         let mut selected_row_ids: Vec<String> = Vec::new();
         let mut selected_mcp_names: Vec<String> = Vec::new();
@@ -1114,7 +1201,17 @@ impl ConversationService {
             updated_at: now,
         };
 
-        self.conversation_repo.create(&row).await?;
+        let verified_session_mcp_trust = if session_mcp_trust.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&session_mcp_trust)
+                    .map_err(|_| ConversationError::internal("Failed to serialize session MCP trust snapshot"))?,
+            )
+        };
+        self.conversation_repo
+            .create_with_verified_session_mcp_trust(&row, verified_session_mcp_trust.as_deref())
+            .await?;
 
         if let Some(snapshot) = assistant_snapshot.as_ref() {
             let resolved_skill_ids = serde_json::to_string(&snapshot.resolved_defaults.skill_ids).map_err(|e| {
@@ -1165,7 +1262,12 @@ impl ConversationService {
             self.persist_assistant_preferences_from_snapshot(snapshot).await?;
         }
 
-        let mut response = row_to_response(row, &self.workspace_root)?;
+        let mut response = row_to_response_with_extra_and_verified_trust(
+            row,
+            extra.clone(),
+            &session_mcp_trust,
+            &self.workspace_root,
+        )?;
         if let Some(snapshot) = assistant_snapshot.as_ref() {
             response.assistant = Some(aionui_api_types::ConversationAssistantIdentityResponse {
                 id: snapshot.assistant_id.clone(),
@@ -1745,7 +1847,13 @@ impl ConversationService {
         let mut extra: serde_json::Value = serde_json::from_str(&row.extra)
             .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
         self.backfill_extra_inplace(&row.id, &mut extra).await;
-        let mut response = row_to_response_with_extra(row, extra, &self.workspace_root)?;
+        let verified_session_mcp_trust = self.load_verified_session_mcp_trust(&row.id).await?;
+        let mut response = row_to_response_with_extra_and_verified_trust(
+            row,
+            extra,
+            &verified_session_mcp_trust,
+            &self.workspace_root,
+        )?;
         self.attach_assistant_identity(&mut response).await?;
         response.runtime = Some(self.runtime_summary_for(id).await);
         Ok(response)
@@ -1787,7 +1895,13 @@ impl ConversationService {
                 }
             };
             self.backfill_extra_inplace(&row_id, &mut extra).await;
-            match row_to_response_with_extra(row, extra, &self.workspace_root) {
+            let verified_session_mcp_trust = self.load_verified_session_mcp_trust(&row_id).await?;
+            match row_to_response_with_extra_and_verified_trust(
+                row,
+                extra,
+                &verified_session_mcp_trust,
+                &self.workspace_root,
+            ) {
                 Ok(mut resp) => {
                     self.attach_assistant_identity(&mut resp).await?;
                     items.push(resp);
@@ -1833,14 +1947,10 @@ impl ConversationService {
         // must not be re-shaped by PATCH. The frontend must clone the
         // conversation to produce a new snapshot.
         if let Some(incoming) = &req.extra
-            && (incoming.get("skills").is_some()
-                || incoming.get("mcp_server_ids").is_some()
-                || incoming.get("mcp_servers").is_some()
-                || incoming.get("mcp_statuses").is_some()
-                || incoming.get("session_mcp_servers").is_some())
+            && touches_immutable_extra_snapshot(incoming)
         {
             return Err(ConversationError::BadRequest {
-                reason: "extra.skills and MCP snapshots are immutable post-creation".into(),
+                reason: "extra.skills and MCP snapshots, including trust, are immutable post-creation".into(),
             });
         }
 
@@ -1962,7 +2072,15 @@ impl ConversationService {
             .await?
             .ok_or_else(|| ConversationError::internal("Conversation vanished after update"))?;
 
-        let response = row_to_response(updated, &self.workspace_root)?;
+        let verified_session_mcp_trust = self.load_verified_session_mcp_trust(id).await?;
+        let updated_extra: serde_json::Value = serde_json::from_str(&updated.extra)
+            .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
+        let response = row_to_response_with_extra_and_verified_trust(
+            updated,
+            updated_extra,
+            &verified_session_mcp_trust,
+            &self.workspace_root,
+        )?;
 
         info!("Conversation updated");
         self.broadcast_list_changed(id, "updated", response.source.as_ref());
@@ -1977,6 +2095,11 @@ impl ConversationService {
     /// on a spurious model comparison.
     #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
     pub async fn update_extra(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), ConversationError> {
+        if touches_immutable_extra_snapshot(&patch) {
+            return Err(ConversationError::BadRequest {
+                reason: "extra.skills and MCP snapshots, including trust, are immutable post-creation".into(),
+            });
+        }
         let existing =
             self.conversation_repo
                 .get(conversation_id)
@@ -2166,7 +2289,15 @@ impl ConversationService {
         let rows = self.conversation_repo.list_associated(user_id, id).await?;
         let mut items = Vec::with_capacity(rows.len());
         for row in rows {
-            let mut response = row_to_response(row, &self.workspace_root)?;
+            let verified_session_mcp_trust = self.load_verified_session_mcp_trust(&row.id).await?;
+            let extra: serde_json::Value = serde_json::from_str(&row.extra)
+                .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
+            let mut response = row_to_response_with_extra_and_verified_trust(
+                row,
+                extra,
+                &verified_session_mcp_trust,
+                &self.workspace_root,
+            )?;
             self.attach_assistant_identity(&mut response).await?;
             items.push(response);
         }
@@ -2182,7 +2313,15 @@ impl ConversationService {
         let rows = self.conversation_repo.list_by_cron_job(user_id, cron_job_id).await?;
         let mut items = Vec::with_capacity(rows.len());
         for row in rows {
-            let mut response = row_to_response(row, &self.workspace_root)?;
+            let verified_session_mcp_trust = self.load_verified_session_mcp_trust(&row.id).await?;
+            let extra: serde_json::Value = serde_json::from_str(&row.extra)
+                .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
+            let mut response = row_to_response_with_extra_and_verified_trust(
+                row,
+                extra,
+                &verified_session_mcp_trust,
+                &self.workspace_root,
+            )?;
             self.attach_assistant_identity(&mut response).await?;
             items.push(response);
         }
@@ -3256,8 +3395,9 @@ impl ConversationService {
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
         let seed = self.load_aionrs_permission_seed(row).await?;
+        let verified_session_mcp_trust = self.load_verified_session_mcp_trust(&row.id).await?;
         SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options(row, seed)
+            .build_options(row, seed, verified_session_mcp_trust)
             .await
     }
 
@@ -3268,8 +3408,9 @@ impl ConversationService {
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
         let seed = self.load_aionrs_permission_seed(row).await?;
+        let verified_session_mcp_trust = self.load_verified_session_mcp_trust(&row.id).await?;
         SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options_with_workspace_override(row, workspace_override, seed)
+            .build_options_with_workspace_override(row, workspace_override, seed, verified_session_mcp_trust)
             .await
     }
 
@@ -4021,6 +4162,20 @@ fn merge_json(base: &mut serde_json::Value, patch: &serde_json::Value) {
             base_obj.insert(key.clone(), value.clone());
         }
     }
+}
+
+fn touches_immutable_extra_snapshot(value: &serde_json::Value) -> bool {
+    const IMMUTABLE_KEYS: &[&str] = &[
+        "skills",
+        "mcp_server_ids",
+        "mcp_servers",
+        "mcp_statuses",
+        "session_mcp_servers",
+        "selected_session_mcp_servers",
+        "session_mcp_trust",
+        "selected_session_mcp_trust_claims",
+    ];
+    IMMUTABLE_KEYS.iter().any(|key| value.get(*key).is_some())
 }
 
 fn parse_json_string_list(raw: Option<&str>, field: &str) -> Result<Vec<String>, ConversationError> {

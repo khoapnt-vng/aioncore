@@ -386,8 +386,10 @@ name = "aionui-api-types"
 version = "0.1.55"
 dependencies = [
  "aionui-common",
+ "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -574,9 +576,11 @@ dependencies = [
  "axum",
  "base64",
  "chrono",
+ "hmac 0.12.1",
  "regex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

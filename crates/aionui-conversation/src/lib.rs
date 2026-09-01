@@ -16,6 +16,7 @@ pub mod runtime_state;
 pub mod service;
 mod service_ops;
 pub(crate) mod session_context;
+mod session_mcp_trust;
 pub mod skill_resolver;
 pub mod skill_snapshot;
 mod startup_recovery;
@@ -35,6 +36,7 @@ pub use service::{
     ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
     ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService,
 };
+pub use session_mcp_trust::{SESSION_MCP_TRUST_KEY_ENV, SessionMcpTrustAuthority};
 pub use state::ConversationRouterState;
 
 #[cfg(test)]

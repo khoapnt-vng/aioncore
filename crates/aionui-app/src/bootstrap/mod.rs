@@ -12,6 +12,7 @@ mod parent_exit;
 mod tracing_init;
 mod work_dir;
 
+pub(crate) use environment::{PreRuntimeServerEnvironment, prepare_pre_runtime_environment};
 pub use environment::{ServerEnvironment, init_data_layer, init_environment};
 pub(crate) use error::{BootstrapError, BootstrapErrorCode};
 pub(crate) use instance_guard::wait_for_instance_guard;

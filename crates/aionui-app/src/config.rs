@@ -2,6 +2,29 @@
 
 use std::path::PathBuf;
 
+/// Main-process-only key used to authenticate a transient session MCP trust
+/// claim. Debug output is deliberately redacted because startup diagnostics
+/// may format the surrounding application config.
+#[derive(Clone)]
+pub struct SessionMcpTrustKey([u8; 32]);
+
+impl SessionMcpTrustKey {
+    #[doc(hidden)]
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) fn expose(&self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for SessionMcpTrustKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SessionMcpTrustKey([REDACTED])")
+    }
+}
+
 /// Application configuration parsed from CLI arguments.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -16,6 +39,10 @@ pub struct AppConfig {
     /// requests. Populated from the `AIONUI_LOCAL_TOKEN` env var at startup. When
     /// `local` is set, the server refuses to start without it (see `init_environment`).
     pub local_token: Option<String>,
+    /// Short-lived host-authentication key for built-in session MCP claims.
+    /// It is read and removed during synchronous pre-runtime bootstrap so
+    /// spawned user MCP processes cannot inherit it.
+    pub session_mcp_trust_key: Option<SessionMcpTrustKey>,
     /// Dump prompt diagnostics under `data_dir/prompt-dumps`.
     pub dump_prompts: bool,
     /// Explicitly authorize backup and rebuild for corruption-like local databases.
@@ -59,6 +86,7 @@ impl Default for AppConfig {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             local: false,
             local_token: None,
+            session_mcp_trust_key: None,
             dump_prompts: false,
             recover_corrupted_database: false,
         }
@@ -78,6 +106,15 @@ mod tests {
         assert_eq!(config.app_version, env!("CARGO_PKG_VERSION"));
         assert!(!config.dump_prompts);
         assert!(!config.recover_corrupted_database);
+    }
+
+    #[test]
+    fn session_mcp_trust_key_debug_output_is_redacted() {
+        let key = SessionMcpTrustKey::new([0x42; 32]);
+        let rendered = format!("{key:?}");
+
+        assert_eq!(rendered, "SessionMcpTrustKey([REDACTED])");
+        assert!(!rendered.contains("66"));
     }
 
     #[test]

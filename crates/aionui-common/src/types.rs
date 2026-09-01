@@ -56,7 +56,20 @@ pub struct Confirmation {
     pub action: Option<String>,
     pub description: String,
     pub command_type: Option<String>,
+    /// Exact, unmodified MCP identity associated with this approval.
+    ///
+    /// This is data, not display text. Renderers must escape control and bidi
+    /// characters before presenting either value to a person.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_identity: Option<ConfirmationMcpIdentity>,
     pub options: Vec<ConfirmationOption>,
+}
+
+/// Raw MCP server/tool identity for an exact-tool approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmationMcpIdentity {
+    pub server_name: String,
+    pub tool_name: String,
 }
 
 /// A single option within a confirmation dialog.
@@ -142,6 +155,7 @@ mod tests {
             action: None,
             description: "Execute shell command".into(),
             command_type: Some("bash".into()),
+            mcp_identity: None,
             options: vec![ConfirmationOption {
                 label: "Allow".into(),
                 value: serde_json::json!(true),
@@ -151,6 +165,38 @@ mod tests {
         let json = serde_json::to_value(&c).unwrap();
         assert_eq!(json["call_id"], "call1");
         assert_eq!(json["command_type"], "bash");
+        assert!(json.get("mcp_identity").is_none());
+    }
+
+    #[test]
+    fn test_confirmation_mcp_identity_preserves_raw_values() {
+        let raw_server = "studio\u{202e}res\nver";
+        let raw_tool = "raw\0tool";
+        let confirmation = Confirmation {
+            id: "c1".into(),
+            call_id: "call1".into(),
+            title: None,
+            action: Some("proxy_name".into()),
+            description: String::new(),
+            command_type: Some("mcp".into()),
+            mcp_identity: Some(ConfirmationMcpIdentity {
+                server_name: raw_server.into(),
+                tool_name: raw_tool.into(),
+            }),
+            options: vec![],
+        };
+
+        let json = serde_json::to_value(&confirmation).unwrap();
+        assert_eq!(json["mcp_identity"]["server_name"], raw_server);
+        assert_eq!(json["mcp_identity"]["tool_name"], raw_tool);
+        let decoded: Confirmation = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            decoded.mcp_identity,
+            Some(ConfirmationMcpIdentity {
+                server_name: raw_server.into(),
+                tool_name: raw_tool.into(),
+            })
+        );
     }
 
     #[test]

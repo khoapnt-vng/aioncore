@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use aionui_api_types::{ConversationArtifactResponse, ConversationResponse, MessageResponse, MessageSearchItem};
+use aionui_api_types::{
+    ConversationArtifactResponse, ConversationResponse, MessageResponse, MessageSearchItem, SessionMcpTrustSnapshot,
+};
 use aionui_common::{
     AgentType, ConversationSource, ConversationStatus, MessagePosition, MessageStatus, MessageType, ProviderWithModel,
 };
@@ -17,26 +19,25 @@ const TOOL_CONTENT_PREVIEW_CHARS: usize = 4096;
 /// Parses string enum fields and JSON text fields back into typed values.
 /// `data_dir` is required so the response can expose a derived
 /// `is_temporary_workspace` flag without storing that attribute on disk —
-/// see [`row_to_response_with_extra`].
+/// see [`row_to_response_with_extra_and_verified_trust`].
 pub fn row_to_response(row: ConversationRow, data_dir: &Path) -> Result<ConversationResponse, ConversationError> {
     let extra: serde_json::Value = serde_json::from_str(&row.extra)
         .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
-    row_to_response_with_extra(row, extra, data_dir)
+    row_to_response_with_extra_and_verified_trust(row, extra, &[], data_dir)
 }
 
-/// Same as [`row_to_response`] but takes a pre-parsed `extra` value. Used
-/// by callers that need to mutate `extra` (e.g. lazy `skills` backfill)
-/// before building the response DTO.
+/// Builds a response while projecting the separately persisted,
+/// Core-authenticated session MCP trust snapshot into the response-only
+/// `extra` envelope. Any similarly named value in the opaque persisted extra
+/// is always discarded first.
 ///
-/// Injects a derived `is_temporary_workspace: bool` into the returned
-/// `extra` blob by checking whether `extra.workspace` sits under the
-/// backend-managed `data_dir`. The flag is not persisted — it is
-/// computed on every read so the frontend never has to pattern-match
-/// the directory name. Old rows that have no such flag on disk
-/// automatically gain it on read, which means no migration is needed.
-pub fn row_to_response_with_extra(
+/// Also injects a derived `is_temporary_workspace: bool` by checking whether
+/// `extra.workspace` sits under the backend-managed `data_dir`. Neither
+/// projection is written back to the caller-shaped JSON column.
+pub fn row_to_response_with_extra_and_verified_trust(
     row: ConversationRow,
     mut extra: serde_json::Value,
+    verified_session_mcp_trust: &[SessionMcpTrustSnapshot],
     data_dir: &Path,
 ) -> Result<ConversationResponse, ConversationError> {
     let is_temporary_workspace = {
@@ -46,6 +47,14 @@ pub fn row_to_response_with_extra(
     if let Some(obj) = extra.as_object_mut() {
         obj.remove("preset_context");
         obj.remove("preset_rules");
+        obj.remove("session_mcp_trust");
+        if !verified_session_mcp_trust.is_empty() {
+            obj.insert(
+                "session_mcp_trust".to_owned(),
+                serde_json::to_value(verified_session_mcp_trust)
+                    .map_err(|e| ConversationError::internal(format!("Invalid session MCP trust projection: {e}")))?,
+            );
+        }
         obj.insert(
             "is_temporary_workspace".to_owned(),
             serde_json::Value::Bool(is_temporary_workspace),
@@ -362,6 +371,21 @@ mod tests {
         let resp = row_to_response(row, Path::new("/tmp/data")).unwrap();
         assert!(resp.source.is_none());
         assert!(resp.model.is_none());
+    }
+
+    #[test]
+    fn row_to_response_never_projects_trust_from_opaque_extra() {
+        let row = make_row(
+            "aionrs",
+            "pending",
+            None,
+            None,
+            r#"{"session_mcp_trust":[{"server_id":"forged","server_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","resolver_profile":"aioncore.session-mcp-resolver.v1"}]}"#,
+        );
+
+        let resp = row_to_response(row, Path::new("/tmp/data")).unwrap();
+
+        assert!(resp.extra.get("session_mcp_trust").is_none());
     }
 
     #[test]

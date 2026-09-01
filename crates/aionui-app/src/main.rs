@@ -28,6 +28,7 @@ fn main() -> ExitCode {
 
 fn run_main() -> Result<ExitCode, MainError> {
     let cli = Cli::parse();
+    let pre_runtime_environment = bootstrap::prepare_pre_runtime_environment(&cli)?;
 
     // mcp-* subcommands route into short-lived stdio helpers that live entirely
     // outside the main HTTP server. They share the global flags so clap can
@@ -53,7 +54,7 @@ fn run_main() -> Result<ExitCode, MainError> {
         .enable_all()
         .build()
         .map_err(|error| runtime_init_error_for_command(&cli.command, error))?;
-    runtime.block_on(async_main(merged_path, cli))
+    runtime.block_on(async_main(merged_path, cli, pre_runtime_environment))
 }
 
 fn runtime_init_error_for_command(command: &Option<Command>, error: std::io::Error) -> MainError {
@@ -75,7 +76,11 @@ fn runtime_init_error_for_command(command: &Option<Command>, error: std::io::Err
     ))
 }
 
-async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError> {
+async fn async_main(
+    merged_path: String,
+    cli: Cli,
+    pre_runtime_environment: Option<bootstrap::PreRuntimeServerEnvironment>,
+) -> Result<ExitCode, MainError> {
     // MCP stdio helpers must not touch the database, logging setup, or `AppServices`.
     match cli.command {
         Some(Command::Capabilities) => Ok(commands::run_capabilities()),
@@ -87,7 +92,14 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
         Some(Command::Doctor) => Ok(commands::run_doctor(&cli, &merged_path).await?),
         Some(Command::PrepareManagedResources(args)) => Ok(commands::run_prepare_managed_resources(args).await?),
         None => {
-            let mut env = bootstrap::init_environment(&cli, &merged_path)?;
+            let pre_runtime_environment = pre_runtime_environment.ok_or_else(|| {
+                MainError::Bootstrap(bootstrap::BootstrapError::new(
+                    bootstrap::BootstrapErrorCode::ConfigInvalid,
+                    "process.pre_runtime",
+                    "server pre-runtime environment is unavailable",
+                ))
+            })?;
+            let mut env = bootstrap::init_environment(&cli, &merged_path, pre_runtime_environment)?;
 
             // Acquire the data-dir process-level guard before binding a port or
             // touching the DB, so a second aioncore yields structurally rather
