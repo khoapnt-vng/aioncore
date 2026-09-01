@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, security/pilot-hardening-d01-d06]
   pull_request:
-    branches: [main]
+    branches: [main, security/pilot-hardening-d01-d06]
 
 env:
   CARGO_TERM_COLOR: always

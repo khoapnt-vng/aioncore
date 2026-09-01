@@ -37,6 +37,41 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn('git rev-parse "refs/tags/${RELEASE_TAG}^{}"', prepare)
         self.assertIn('test "${head_commit}" = "${tag_commit}"', prepare)
 
+    def test_prepare_release_requires_annotated_tag_merged_into_release_branch(self):
+        prepare = self._job_script("prepare-release")
+        self.assertEqual(
+            self.release["env"]["RELEASE_BRANCH"],
+            "security/pilot-hardening-d01-d06",
+        )
+        self.assertIn(
+            'refs/heads/${RELEASE_BRANCH}:refs/remotes/origin/${RELEASE_BRANCH}',
+            prepare,
+        )
+        tag_type = 'git cat-file -t "refs/tags/${RELEASE_TAG}"'
+        annotated_guard = 'test "${tag_type}" = "tag" || {'
+        tag_commit = 'git rev-parse "refs/tags/${RELEASE_TAG}^{}"'
+        ancestor_guard = (
+            'git merge-base --is-ancestor "${tag_commit}" '
+            '"origin/${RELEASE_BRANCH}" || {'
+        )
+        self.assertIn(tag_type, prepare)
+        self.assertIn(annotated_guard, prepare)
+        self.assertIn(ancestor_guard, prepare)
+        self.assertIn("set -euo pipefail", prepare)
+        self.assertNotIn("set +e", prepare)
+        self.assertNotIn("|| true", prepare)
+        self.assertRegex(
+            prepare,
+            rf"(?s){re.escape(annotated_guard)}.*?exit 1.*?{re.escape(tag_commit)}",
+        )
+        self.assertRegex(
+            prepare,
+            rf'(?s){re.escape(ancestor_guard)}.*?exit 1.*?echo "version=',
+        )
+        self.assertLess(prepare.index(tag_type), prepare.index(annotated_guard))
+        self.assertLess(prepare.index(annotated_guard), prepare.index(tag_commit))
+        self.assertLess(prepare.index(tag_commit), prepare.index(ancestor_guard))
+
     def test_each_build_generates_and_verifies_lineage_and_complete_bundle(self):
         build = self._job_script("build")
         self.assertIn("generate-lineage.py", build)
@@ -93,6 +128,12 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
     def test_ci_runs_all_release_python_contract_tests(self):
         scripts = self._job_script("release-contract", workflow=self.ci)
         self.assertIn("unittest discover -s scripts/release", scripts)
+
+    def test_ci_runs_for_main_and_the_actual_release_branch(self):
+        triggers = self.ci.get("on", self.ci.get(True))
+        expected = {"main", "security/pilot-hardening-d01-d06"}
+        self.assertEqual(set(triggers["push"]["branches"]), expected)
+        self.assertEqual(set(triggers["pull_request"]["branches"]), expected)
 
     def test_manual_build_uploads_a_complete_bundle_for_internal_packaging(self):
         build = self._job_script("build", workflow=self.manual)
@@ -151,23 +192,78 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertNotIn(token, self.release_text)
 
+    def test_manual_archives_refuse_existing_destinations(self):
+        unix_package = self._step_script(
+            "build", "Package binary (Unix)", self.manual
+        )
+        windows_package = self._step_script(
+            "build", "Package binary (Windows)", self.manual
+        )
+        unix_guard = 'test ! -e "dist/${ARCHIVE}"'
+        windows_guard = "Test-Path -LiteralPath $archivePath"
+        self.assertIn(unix_guard, unix_package)
+        self.assertIn(windows_guard, windows_package)
+        self.assertIn(
+            'throw "Refusing to overwrite existing archive ${archivePath}"',
+            windows_package,
+        )
+        self.assertLess(
+            unix_package.index(unix_guard), unix_package.index("tar -C work/bundle")
+        )
+        self.assertLess(
+            windows_package.index(windows_guard),
+            windows_package.index("Compress-Archive"),
+        )
+        self.assertNotIn("-Force", unix_package)
+        self.assertNotIn("-Force", windows_package)
+        self.assertNotRegex(unix_package, r"(?m)^\s*(rm|unlink)\b")
+        self.assertNotIn("Remove-Item", windows_package)
+
     def test_release_actions_are_pinned_to_full_commit_shas(self):
-        action_refs = [
-            step["uses"]
-            for job in self.release["jobs"].values()
-            for step in job.get("steps", [])
-            if "uses" in step and not step["uses"].startswith("./")
-        ]
+        action_refs = self._external_action_refs(self.release)
         self.assertTrue(action_refs)
         for action_ref in action_refs:
             with self.subTest(action_ref=action_ref):
                 self.assertRegex(action_ref, r"^[^@]+@[0-9a-f]{40}$")
+
+    def test_manual_actions_are_pinned_to_the_reviewed_release_shas(self):
+        release_refs = self._action_refs_by_name(self.release)
+        manual_refs = self._action_refs_by_name(self.manual)
+        self.assertTrue(manual_refs)
+        for action_name, refs in manual_refs.items():
+            with self.subTest(action_name=action_name):
+                self.assertIn(action_name, release_refs)
+                self.assertEqual(refs, release_refs[action_name])
+                for action_ref in refs:
+                    self.assertRegex(action_ref, r"^[^@]+@[0-9a-f]{40}$")
 
     @staticmethod
     def _job_script(name, workflow=None):
         workflow = workflow or ReleaseWorkflowContractTests.release
         job = workflow["jobs"][name]
         return "\n".join(str(step.get("run", "")) for step in job.get("steps", []))
+
+    @staticmethod
+    def _step_script(job_name, step_name, workflow):
+        steps = workflow["jobs"][job_name]["steps"]
+        return next(str(step.get("run", "")) for step in steps if step.get("name") == step_name)
+
+    @staticmethod
+    def _external_action_refs(workflow):
+        return [
+            step["uses"]
+            for job in workflow["jobs"].values()
+            for step in job.get("steps", [])
+            if "uses" in step and not step["uses"].startswith("./")
+        ]
+
+    @classmethod
+    def _action_refs_by_name(cls, workflow):
+        refs = {}
+        for action_ref in cls._external_action_refs(workflow):
+            action_name = action_ref.split("@", 1)[0]
+            refs.setdefault(action_name, set()).add(action_ref)
+        return refs
 
 
 if __name__ == "__main__":

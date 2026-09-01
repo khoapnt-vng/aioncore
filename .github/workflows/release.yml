@@ -25,6 +25,7 @@ env:
   CARGO_HTTP_TIMEOUT: "600"
   CARGO_NET_RETRY: "10"
   RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
+  RELEASE_BRANCH: security/pilot-hardening-d01-d06
 
 jobs:
   prepare-release:
@@ -39,7 +40,7 @@ jobs:
           fetch-depth: 0
           ref: refs/tags/${{ env.RELEASE_TAG }}
 
-      - name: Verify exact tag, version, and peeled commit
+      - name: Verify exact annotated tag, version, and merged commit
         id: metadata
         shell: bash
         run: |
@@ -53,10 +54,21 @@ jobs:
             echo "::error::Workspace version is ${workspace_version}, expected 0.1.55"
             exit 1
           }
+          git fetch --no-tags origin \
+            "refs/heads/${RELEASE_BRANCH}:refs/remotes/origin/${RELEASE_BRANCH}"
+          tag_type="$(git cat-file -t "refs/tags/${RELEASE_TAG}")"
+          test "${tag_type}" = "tag" || {
+            echo "::error::${RELEASE_TAG} must be an annotated tag"
+            exit 1
+          }
           head_commit="$(git rev-parse HEAD)"
           tag_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{}")"
           test "${head_commit}" = "${tag_commit}" || {
             echo "::error::Checked-out commit does not equal the peeled tag commit"
+            exit 1
+          }
+          git merge-base --is-ancestor "${tag_commit}" "origin/${RELEASE_BRANCH}" || {
+            echo "::error::${RELEASE_TAG} must point to a commit merged into ${RELEASE_BRANCH}"
             exit 1
           }
           echo "version=${workspace_version}" >> "$GITHUB_OUTPUT"
