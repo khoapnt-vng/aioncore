@@ -40,8 +40,9 @@ pub use acp::{
 };
 pub use acp_prompt_hook::AcpPromptHookWarningPayload;
 pub use agent_build_extra::{
-    AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, SessionMcpServer, SessionMcpTransport,
-    SlashCommandCompletionBehavior, SlashCommandItem,
+    AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, SESSION_MCP_RESOLVER_PROFILE_V1, SessionMcpServer,
+    SessionMcpTransport, SessionMcpTrustClaim, SessionMcpTrustSnapshot, SlashCommandCompletionBehavior,
+    SlashCommandItem, session_mcp_server_fingerprint,
 };
 pub use agent_discovery::{
     AgentEnvEntry, AgentHandshake, AgentLogoEntry, AgentManagementRow, AgentManagementStatus, AgentMetadata,

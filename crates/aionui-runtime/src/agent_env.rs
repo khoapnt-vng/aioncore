@@ -47,7 +47,15 @@ fn build_agent_process_env(
 }
 
 fn clean_agent_env(env: &mut BTreeMap<OsString, OsString>) {
-    for key in ["NODE_OPTIONS", "NODE_INSPECT", "NODE_DEBUG", "CLAUDECODE"] {
+    for key in [
+        "NODE_OPTIONS",
+        "NODE_INSPECT",
+        "NODE_DEBUG",
+        "CLAUDECODE",
+        "AIONUI_BOOTSTRAP_SECRETS_STDIN",
+        "AIONUI_LOCAL_TOKEN",
+        "AIONUI_SESSION_MCP_TRUST_KEY",
+    ] {
         remove_env_key(env, key);
     }
     env.retain(|key, _| !env_key_starts_with(key, "npm_"));
@@ -236,6 +244,9 @@ printf '%s\n' \
                 .env("NODE_OPTIONS", "--require parent")
                 .env("CLAUDECODE", "1")
                 .env("npm_config_cache", "/tmp/parent-cache")
+                .env("AIONUI_BOOTSTRAP_SECRETS_STDIN", "1")
+                .env("AIONUI_LOCAL_TOKEN", "must-not-survive")
+                .env("AIONUI_SESSION_MCP_TRUST_KEY", "must-not-survive")
                 .output()
                 .unwrap();
             assert!(
@@ -261,6 +272,9 @@ printf '%s\n' \
         assert_eq!(value("CLAUDECODE"), None);
         assert_eq!(value("npm_config_cache"), None);
         assert_eq!(value("npm_lifecycle_event"), None);
+        assert_eq!(value("AIONUI_BOOTSTRAP_SECRETS_STDIN"), None);
+        assert_eq!(value("AIONUI_LOCAL_TOKEN"), None);
+        assert_eq!(value("AIONUI_SESSION_MCP_TRUST_KEY"), None);
 
         let path = value("PATH").expect("PATH should be present");
         assert!(

@@ -572,6 +572,7 @@ mod tests {
                 server_url: server_url.to_owned(),
                 access_token: t.clone(),
                 refresh_token: None,
+                client_id: None,
                 token_type: "bearer".to_owned(),
                 expires_at: None,
                 created_at: 0,

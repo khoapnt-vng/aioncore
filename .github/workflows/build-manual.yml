@@ -1,6 +1,9 @@
 name: "🔨 Manual Build"
 
 on:
+  push:
+    tags:
+      - "internal-sprint3-aioncore-*"
   workflow_dispatch:
     inputs:
       branch:
@@ -14,11 +17,7 @@ on:
         type: choice
         options:
           - macos-arm64
-          - macos-x64
           - windows-x64
-          - windows-arm64
-          - linux-x64
-          - linux-arm64
           - all
         default: "macos-arm64"
 
@@ -30,10 +29,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_HTTP_TIMEOUT: "600"
   CARGO_NET_RETRY: "10"
-  # cross commit used by the v0.1.39/v0.1.40 Linux ARM64 release builds.
-  CROSS_GIT_REV: "29d00c7803f221f1b3f35e561b03792368fb8339"
-  LINUX_X64_GLIBC_MAX: "GLIBC_2.34"
-  LINUX_ARM64_GLIBC_MAX: "GLIBC_2.30"
 
 jobs:
   prepare-matrix:
@@ -47,29 +42,17 @@ jobs:
         id: set-matrix
         shell: bash
         run: |
-          PLATFORM="${{ inputs.platform }}"
+          PLATFORM="${{ inputs.platform || 'internal-two-target' }}"
 
-          MACOS_ARM64='{"platform":"macos-arm64","os":"macos-latest","target":"aarch64-apple-darwin","binary_name":"aioncore","artifact_name":"aioncore-manual-macos-arm64","use_cross":false}'
-          MACOS_X64='{"platform":"macos-x64","os":"macos-latest","target":"x86_64-apple-darwin","binary_name":"aioncore","artifact_name":"aioncore-manual-macos-x64","use_cross":false}'
-          WINDOWS_X64='{"platform":"windows-x64","os":"windows-latest","target":"x86_64-pc-windows-msvc","binary_name":"aioncore.exe","artifact_name":"aioncore-manual-windows-x64","rustflags":"-C target-feature=+crt-static","use_cross":false}'
-          WINDOWS_ARM64='{"platform":"windows-arm64","os":"windows-latest","target":"aarch64-pc-windows-msvc","binary_name":"aioncore.exe","artifact_name":"aioncore-manual-windows-arm64","rustflags":"-C target-feature=+crt-static","use_cross":false}'
-          LINUX_X64='{"platform":"linux-x64","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","binary_name":"aioncore","artifact_name":"aioncore-manual-linux-x64","use_cross":false}'
-          LINUX_ARM64='{"platform":"linux-arm64","os":"ubuntu-latest","target":"aarch64-unknown-linux-gnu","binary_name":"aioncore","artifact_name":"aioncore-manual-linux-arm64","use_cross":true}'
+          MACOS_ARM64='{"platform":"macos-arm64","os":"macos-latest","target":"aarch64-apple-darwin","binary_name":"aioncore","artifact_name":"aioncore-manual-macos-arm64"}'
+          WINDOWS_X64='{"platform":"windows-x64","os":"windows-latest","target":"x86_64-pc-windows-msvc","binary_name":"aioncore.exe","artifact_name":"aioncore-manual-windows-x64","rustflags":"-C target-feature=+crt-static"}'
 
-          if [ "$PLATFORM" = "all" ]; then
-            MATRIX="{\"include\":[$MACOS_ARM64,$MACOS_X64,$WINDOWS_X64,$WINDOWS_ARM64,$LINUX_X64,$LINUX_ARM64]}"
+          if [ "$PLATFORM" = "internal-two-target" ] || [ "$PLATFORM" = "all" ]; then
+            MATRIX="{\"include\":[$MACOS_ARM64,$WINDOWS_X64]}"
           elif [ "$PLATFORM" = "macos-arm64" ]; then
             MATRIX="{\"include\":[$MACOS_ARM64]}"
-          elif [ "$PLATFORM" = "macos-x64" ]; then
-            MATRIX="{\"include\":[$MACOS_X64]}"
           elif [ "$PLATFORM" = "windows-x64" ]; then
             MATRIX="{\"include\":[$WINDOWS_X64]}"
-          elif [ "$PLATFORM" = "windows-arm64" ]; then
-            MATRIX="{\"include\":[$WINDOWS_ARM64]}"
-          elif [ "$PLATFORM" = "linux-x64" ]; then
-            MATRIX="{\"include\":[$LINUX_X64]}"
-          elif [ "$PLATFORM" = "linux-arm64" ]; then
-            MATRIX="{\"include\":[$LINUX_ARM64]}"
           fi
 
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
@@ -85,9 +68,14 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v6
+      - name: Configure LF checkout on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ inputs.branch }}
+          ref: ${{ inputs.branch || github.sha }}
 
       - name: Get commit hash
         id: commit
@@ -97,7 +85,7 @@ jobs:
           echo "short=$SHORT" >> "$GITHUB_OUTPUT"
           echo "Commit: $SHORT"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: "1.95.0"
           targets: ${{ matrix.target }}
@@ -108,17 +96,9 @@ jobs:
         run: Remove-Item 'C:\Program Files\Git\usr\bin\link.exe' -Force -ErrorAction SilentlyContinue
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: manual-build-${{ matrix.target }}-${{ matrix.os }}${{ matrix.target == 'x86_64-unknown-linux-gnu' && format('-glibc-{0}', env.LINUX_X64_GLIBC_MAX) || '' }}${{ matrix.use_cross == true && format('-cross-{0}-glibc-{1}', env.CROSS_GIT_REV, env.LINUX_ARM64_GLIBC_MAX) || '' }}
-
-      - name: Verify pinned Linux ARM64 cross image is available
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: docker pull ghcr.io/cross-rs/aarch64-unknown-linux-gnu@sha256:99e041b94e7d4f31477c6ddede176688562c3762ba3833b75de3316100afc39d
-
-      - name: Install cross (Linux targets)
-        if: matrix.use_cross == true
-        run: cargo install cross --git https://github.com/cross-rs/cross --rev "${CROSS_GIT_REV}" --locked
+          shared-key: manual-build-${{ matrix.target }}-${{ matrix.os }}
 
       - name: Build release binary
         shell: bash
@@ -129,21 +109,50 @@ jobs:
             echo "Using RUSTFLAGS=${RUSTFLAGS}"
           fi
 
-          if [[ "${{ matrix.use_cross }}" == "true" ]]; then
-            cross build --release --target ${{ matrix.target }} -p aionui-app
-          else
-            cargo build --release --target ${{ matrix.target }} -p aionui-app
+          if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
+            test -f "/c/Strawberry/perl/bin/perl.exe" || {
+              echo "::error::Strawberry Perl is required for the Windows OpenSSL build"
+              exit 1
+            }
+            export OPENSSL_SRC_PERL="C:/Strawberry/perl/bin/perl.exe"
           fi
 
-      - name: Verify Linux ARM64 GLIBC baseline
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        shell: bash
-        run: scripts/check-glibc-baseline.sh "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "${LINUX_ARM64_GLIBC_MAX}"
+          cargo build --release --target ${{ matrix.target }} -p aionui-app
 
-      - name: Verify Linux x64 GLIBC baseline
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+      - name: Prepare complete internal-test bundle
         shell: bash
-        run: scripts/check-glibc-baseline.sh "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "${LINUX_X64_GLIBC_MAX}"
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
+          test -f "${binary}"
+          python3 scripts/migration/generate-lineage.py \
+            --migrations crates/aionui-db/migrations \
+            --check migration-lineage.json
+          "${binary}" \
+            --data-dir "${PWD}/work/release-data" \
+            prepare-managed-resources \
+            --bundle-out "${PWD}/work/managed-resources"
+          python3 scripts/release/prepare_officecli.py \
+            --managed-resources work/managed-resources \
+            --target "${{ matrix.target }}"
+          source_commit="$(git rev-parse HEAD)"
+          built_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          python3 scripts/release/assemble_bundle.py \
+            --binary "${binary}" \
+            --lineage migration-lineage.json \
+            --managed-resources work/managed-resources \
+            --output work/bundle \
+            --repository khoapnt-vng/aioncore \
+            --version 0.1.55 \
+            --source-commit "${source_commit}" \
+            --target "${{ matrix.target }}" \
+            --built-at "${built_at}"
+          python3 scripts/release/verify_bundle.py \
+            --bundle work/bundle \
+            --repository khoapnt-vng/aioncore \
+            --version 0.1.55 \
+            --source-commit "${source_commit}" \
+            --target "${{ matrix.target }}"
 
       - name: Package binary (Unix)
         if: runner.os != 'Windows'
@@ -151,9 +160,11 @@ jobs:
         env:
           COMMIT_SHORT: ${{ steps.commit.outputs.short }}
         run: |
-          mkdir -p dist
+          set -euo pipefail
           ARCHIVE="aioncore-${COMMIT_SHORT}-${{ matrix.target }}.tar.gz"
-          tar -C target/${{ matrix.target }}/release -czf "dist/${ARCHIVE}" ${{ matrix.binary_name }}
+          mkdir dist
+          test ! -e "dist/${ARCHIVE}"
+          tar -C work/bundle -czf "dist/${ARCHIVE}" .
           echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
 
       - name: Package binary (Windows)
@@ -162,13 +173,18 @@ jobs:
         env:
           COMMIT_SHORT: ${{ steps.commit.outputs.short }}
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path dist | Out-Null
           $archive = "aioncore-${env:COMMIT_SHORT}-${{ matrix.target }}.zip"
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" -DestinationPath "dist/${archive}" -Force
+          $archivePath = "dist/${archive}"
+          if (Test-Path -LiteralPath $archivePath) {
+            throw "Refusing to overwrite existing archive ${archivePath}"
+          }
+          Compress-Archive -Path "work/bundle/*" -DestinationPath $archivePath
           "ARCHIVE=${archive}" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload manual build artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.artifact_name }}
           path: dist/${{ env.ARCHIVE }}
@@ -195,6 +211,6 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Key | Value |" >> "$GITHUB_STEP_SUMMARY"
           echo "|-----|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Ref | \`${{ inputs.branch }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Ref | \`${{ inputs.branch || github.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Platforms | \`${PLATFORMS}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Artifacts | \`${ARTIFACTS}\` |" >> "$GITHUB_STEP_SUMMARY"

@@ -288,6 +288,7 @@ mod tests {
             action: None,
             description: "Write /tmp/current_time.txt".to_owned(),
             command_type: Some("edit".to_owned()),
+            mcp_identity: None,
             options: vec![aionui_common::ConfirmationOption {
                 label: "Allow".to_owned(),
                 value: json!("allow_once"),

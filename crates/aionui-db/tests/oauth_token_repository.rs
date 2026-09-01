@@ -20,6 +20,7 @@ fn sample_params() -> UpsertOAuthTokenParams<'static> {
         server_url: "https://mcp.example.com",
         access_token: "enc_access_token_123",
         refresh_token: Some("enc_refresh_token_456"),
+        client_id: None,
         token_type: "bearer",
         expires_at: Some(1700000000000),
     }
@@ -51,6 +52,75 @@ async fn upsert_insert_then_get_returns_token() {
     assert_eq!(found.access_token, "enc_access_token_123");
 }
 
+#[tokio::test]
+async fn upsert_and_get_preserve_dynamic_client_identity() {
+    let (r, _db) = repo().await;
+    let inserted = r
+        .upsert(UpsertOAuthTokenParams {
+            server_url: "https://dynamic.example.com",
+            access_token: "enc_dynamic_access",
+            refresh_token: Some("enc_dynamic_refresh"),
+            client_id: Some("dynamic-client"),
+            token_type: "bearer",
+            expires_at: Some(1700000000000),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(inserted.client_id.as_deref(), Some("dynamic-client"));
+
+    let found = r.get_by_url("https://dynamic.example.com").await.unwrap().unwrap();
+    assert_eq!(found.client_id.as_deref(), Some("dynamic-client"));
+}
+
+#[tokio::test]
+async fn get_legacy_token_returns_missing_client_identity() {
+    let (r, db) = repo().await;
+    sqlx::query(
+        "INSERT INTO oauth_tokens (
+            server_url, access_token, refresh_token, token_type, expires_at, created_at, updated_at
+         ) VALUES ('https://legacy.example.com', 'legacy_access', 'legacy_refresh', 'bearer', NULL, 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let found = r.get_by_url("https://legacy.example.com").await.unwrap().unwrap();
+    assert_eq!(found.access_token, "legacy_access");
+    assert_eq!(found.refresh_token.as_deref(), Some("legacy_refresh"));
+    assert_eq!(found.client_id, None);
+}
+
+#[tokio::test]
+async fn updating_token_material_without_client_id_preserves_dynamic_identity() {
+    let (r, _db) = repo().await;
+    r.upsert(UpsertOAuthTokenParams {
+        server_url: "https://dynamic.example.com",
+        access_token: "initial_access",
+        refresh_token: Some("initial_refresh"),
+        client_id: Some("dynamic-client"),
+        token_type: "bearer",
+        expires_at: Some(1700000000000),
+    })
+    .await
+    .unwrap();
+
+    let updated = r
+        .upsert(UpsertOAuthTokenParams {
+            server_url: "https://dynamic.example.com",
+            access_token: "refreshed_access",
+            refresh_token: Some("refreshed_refresh"),
+            client_id: None,
+            token_type: "bearer",
+            expires_at: Some(1800000000000),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(updated.access_token, "refreshed_access");
+    assert_eq!(updated.client_id.as_deref(), Some("dynamic-client"));
+}
+
 // -- Upsert updates existing --
 
 #[tokio::test]
@@ -63,6 +133,7 @@ async fn upsert_updates_existing_token() {
             server_url: "https://mcp.example.com",
             access_token: "new_access_token",
             refresh_token: None,
+            client_id: None,
             token_type: "bearer",
             expires_at: Some(1800000000000),
         })
@@ -87,6 +158,7 @@ async fn upsert_without_refresh_token_or_expires_at() {
             server_url: "https://simple.example.com",
             access_token: "simple_token",
             refresh_token: None,
+            client_id: None,
             token_type: "bearer",
             expires_at: None,
         })
@@ -134,6 +206,7 @@ async fn list_authenticated_urls_returns_all() {
         server_url: "https://other.example.com",
         access_token: "token2",
         refresh_token: None,
+        client_id: None,
         token_type: "bearer",
         expires_at: None,
     })
@@ -156,6 +229,7 @@ async fn delete_one_does_not_affect_others() {
         server_url: "https://other.example.com",
         access_token: "token2",
         refresh_token: None,
+        client_id: None,
         token_type: "bearer",
         expires_at: None,
     })
@@ -193,6 +267,7 @@ async fn full_oauth_lifecycle() {
             server_url: "https://mcp.example.com",
             access_token: "refreshed_token",
             refresh_token: Some("new_refresh"),
+            client_id: None,
             token_type: "bearer",
             expires_at: Some(1900000000000),
         })

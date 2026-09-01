@@ -21,7 +21,8 @@ use aionui_ai_agent::{
 use aionui_api_types::{
     AcpConfigOptionDto, AgentErrorCode, AgentModeResponse, ConfigOptionConfirmation, ConversationArtifactKind,
     ConversationResponse, GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload,
-    SetConfigOptionRequest, SetConfigOptionResponse,
+    SESSION_MCP_RESOLVER_PROFILE_V1, SessionMcpServer, SessionMcpTransport, SessionMcpTrustClaim,
+    SetConfigOptionRequest, SetConfigOptionResponse, session_mcp_server_fingerprint,
 };
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
@@ -47,12 +48,16 @@ use aionui_db::{
 use aionui_db::{MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult};
 use aionui_extension::{AssistantRuleDispatcher, ExtensionError};
 use aionui_realtime::EventBroadcaster;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use hmac::{Hmac, Mac};
 use serde_json::json;
+use sha2::Sha256;
 use tokio::sync::{Notify, broadcast};
 
 use crate::service::ConversationService;
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
-use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError};
+use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError, SessionMcpTrustAuthority};
 
 #[path = "service_test/acp_error_recovery_test.rs"]
 mod acp_error_recovery_test;
@@ -206,6 +211,7 @@ impl AgentAvailabilityFeedbackPort for RecordingAvailabilityFeedback {
 
 struct MockRepo {
     rows: Mutex<Vec<ConversationRow>>,
+    verified_session_mcp_trust: Mutex<std::collections::HashMap<String, String>>,
     messages: Mutex<Vec<MessageRow>>,
     artifacts: Mutex<Vec<ConversationArtifactRow>>,
     assistant_snapshots: Mutex<Vec<ConversationAssistantSnapshotRow>>,
@@ -215,6 +221,7 @@ impl MockRepo {
     fn new() -> Self {
         Self {
             rows: Mutex::new(vec![]),
+            verified_session_mcp_trust: Mutex::new(std::collections::HashMap::new()),
             messages: Mutex::new(vec![]),
             artifacts: Mutex::new(vec![]),
             assistant_snapshots: Mutex::new(vec![]),
@@ -255,6 +262,25 @@ impl IConversationRepository for MockRepo {
         Ok(())
     }
 
+    async fn create_with_verified_session_mcp_trust(
+        &self,
+        row: &ConversationRow,
+        verified_session_mcp_trust: Option<&str>,
+    ) -> Result<(), aionui_db::DbError> {
+        self.rows.lock().unwrap().push(row.clone());
+        if let Some(value) = verified_session_mcp_trust {
+            self.verified_session_mcp_trust
+                .lock()
+                .unwrap()
+                .insert(row.id.clone(), value.to_owned());
+        }
+        Ok(())
+    }
+
+    async fn get_verified_session_mcp_trust(&self, id: &str) -> Result<Option<String>, aionui_db::DbError> {
+        Ok(self.verified_session_mcp_trust.lock().unwrap().get(id).cloned())
+    }
+
     async fn update(&self, id: &str, updates: &ConversationRowUpdate) -> Result<(), aionui_db::DbError> {
         let mut rows = self.rows.lock().unwrap();
         let row = rows
@@ -293,6 +319,7 @@ impl IConversationRepository for MockRepo {
         if rows.len() == len_before {
             return Err(aionui_db::DbError::NotFound(format!("Conversation {id}")));
         }
+        self.verified_session_mcp_trust.lock().unwrap().remove(id);
         Ok(())
     }
 
@@ -1198,6 +1225,58 @@ fn make_create_req_with_backend(backend: &str) -> CreateConversationRequest {
     .unwrap()
 }
 
+const TEST_SESSION_MCP_TRUST_KEY: [u8; 32] = [0x42; 32];
+
+fn test_session_mcp_server() -> SessionMcpServer {
+    SessionMcpServer {
+        id: "studio-project-1".into(),
+        name: "aionui-creative-studio".into(),
+        transport: SessionMcpTransport::Stdio {
+            command: "node".into(),
+            args: vec!["/app/out/main/builtin-mcp-studio.js".into()],
+            env: std::collections::HashMap::from([("STUDIO_PROJECT_ID".into(), "project-1".into())]),
+        },
+    }
+}
+
+fn signed_session_mcp_trust_claim(server: &SessionMcpServer, nonce: [u8; 16]) -> SessionMcpTrustClaim {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let payload = json!({
+        "version": 1,
+        "audience": "aioncore.session-mcp-trust",
+        "server_id": server.id,
+        "server_fingerprint": session_mcp_server_fingerprint(server),
+        "issued_at_ms": now_ms - 1_000,
+        "expires_at_ms": now_ms + 119_000,
+        "nonce": URL_SAFE_NO_PAD.encode(nonce),
+    });
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    let mut mac = Hmac::<Sha256>::new_from_slice(&TEST_SESSION_MCP_TRUST_KEY).unwrap();
+    mac.update(&payload_bytes);
+    SessionMcpTrustClaim {
+        payload: URL_SAFE_NO_PAD.encode(payload_bytes),
+        signature: URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()),
+    }
+}
+
+fn session_mcp_trust_create_request(
+    server: &SessionMcpServer,
+    claim: &SessionMcpTrustClaim,
+) -> CreateConversationRequest {
+    serde_json::from_value(json!({
+        "type": "aionrs",
+        "extra": {
+            "workspace": ensure_test_workspace_path(),
+            "selected_session_mcp_servers": [server],
+            "selected_session_mcp_trust_claims": [claim],
+        },
+    }))
+    .unwrap()
+}
+
 fn ensure_test_workspace_path() -> String {
     let workspace = std::env::temp_dir().join("aionui-conversation-service-test-project");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -1384,6 +1463,247 @@ async fn create_returns_conversation_with_defaults() {
     assert_eq!(events[0].data["action"], "created");
     assert_eq!(events[0].data["conversation_id"], resp.id);
     assert_eq!(events[0].data["source"], "aionui");
+}
+
+#[tokio::test]
+async fn create_authenticates_and_persists_only_backend_owned_session_mcp_trust() {
+    let (svc, _broadcaster, repo, task_mgr) = make_service();
+    let svc = svc.with_session_mcp_trust_authority(Some(Arc::new(SessionMcpTrustAuthority::new(
+        TEST_SESSION_MCP_TRUST_KEY,
+    ))));
+    let server = test_session_mcp_server();
+    let claim = signed_session_mcp_trust_claim(&server, [1; 16]);
+
+    let created = svc
+        .create("user_1", session_mcp_trust_create_request(&server, &claim))
+        .await
+        .unwrap();
+
+    assert!(created.extra.get("selected_session_mcp_trust_claims").is_none());
+    assert_eq!(
+        created.extra["session_mcp_trust"],
+        json!([{
+            "server_id": server.id,
+            "server_fingerprint": session_mcp_server_fingerprint(&server),
+            "resolver_profile": SESSION_MCP_RESOLVER_PROFILE_V1,
+        }])
+    );
+    let persisted = repo.get(&created.id).await.unwrap().unwrap();
+    let persisted_extra: serde_json::Value = serde_json::from_str(&persisted.extra).unwrap();
+    assert!(persisted_extra.get("session_mcp_trust").is_none());
+    assert!(
+        repo.get_verified_session_mcp_trust(&created.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let options = svc.build_task_options(&persisted).await.unwrap();
+    let AgentSessionKind::Aionrs(context) = options.context.kind else {
+        panic!("expected aionrs runtime context");
+    };
+    assert_eq!(
+        serde_json::to_value(&context.config.session_mcp_trust).unwrap(),
+        created.extra["session_mcp_trust"]
+    );
+
+    let update: UpdateConversationRequest = serde_json::from_value(json!({
+        "name": "renamed",
+        "extra": { "display_density": "compact" },
+    }))
+    .unwrap();
+    svc.update("user_1", &created.id, update, &task_mgr).await.unwrap();
+    svc.update_extra(&created.id, json!({ "display_mode": "canvas" }))
+        .await
+        .unwrap();
+    let internal_update_error = svc
+        .update_extra(
+            &created.id,
+            json!({ "session_mcp_trust": [{
+                "server_id": "forged",
+                "server_fingerprint": "0".repeat(64),
+            }] }),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(internal_update_error, ConversationError::BadRequest { .. }));
+    let reloaded = svc.get("user_1", &created.id).await.unwrap();
+    assert_eq!(reloaded.extra["session_mcp_trust"], created.extra["session_mcp_trust"]);
+    assert_eq!(reloaded.extra["display_mode"], "canvas");
+    let listed = svc.list("user_1", ListConversationsQuery::default()).await.unwrap();
+    let listed = listed.items.iter().find(|item| item.id == created.id).unwrap();
+    assert_eq!(listed.extra["session_mcp_trust"], created.extra["session_mcp_trust"]);
+}
+
+#[tokio::test]
+async fn create_strips_caller_supplied_session_mcp_trust_snapshot() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "aionrs",
+        "extra": {
+            "workspace": ensure_test_workspace_path(),
+            "session_mcp_trust": [{
+                "server_id": "forged",
+                "server_fingerprint": "0".repeat(64),
+            }],
+        },
+    }))
+    .unwrap();
+
+    let created = svc.create("user_1", req).await.unwrap();
+    assert!(created.extra.get("session_mcp_trust").is_none());
+}
+
+#[tokio::test]
+async fn legacy_or_corrupt_extra_never_becomes_response_or_runtime_trust() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let forged_server = test_session_mcp_server();
+    let forged_snapshot = json!([{
+        "server_id": forged_server.id.clone(),
+        "server_fingerprint": session_mcp_server_fingerprint(&forged_server),
+        "resolver_profile": SESSION_MCP_RESOLVER_PROFILE_V1,
+    }]);
+    let row = ConversationRow {
+        id: "legacy-forged-session-mcp-trust".into(),
+        user_id: "user_1".into(),
+        name: "legacy forged trust".into(),
+        r#type: "aionrs".into(),
+        extra: json!({
+            "workspace": ensure_test_workspace_path(),
+            "session_mcp_servers": [forged_server],
+            "session_mcp_trust": forged_snapshot,
+        })
+        .to_string(),
+        model: None,
+        status: Some("pending".into()),
+        source: Some("aionui".into()),
+        channel_chat_id: None,
+        pinned: false,
+        pinned_at: None,
+        created_at: 1,
+        updated_at: 1,
+    };
+    repo.create(&row).await.unwrap();
+
+    let response = svc.get("user_1", &row.id).await.unwrap();
+    assert!(response.extra.get("session_mcp_trust").is_none());
+    let options = svc.build_task_options(&row).await.unwrap();
+    let AgentSessionKind::Aionrs(context) = options.context.kind else {
+        panic!("expected aionrs runtime context");
+    };
+    assert!(context.config.session_mcp_trust.is_empty());
+
+    repo.verified_session_mcp_trust
+        .lock()
+        .unwrap()
+        .insert(row.id.clone(), "not-json".into());
+    let response = svc.get("user_1", &row.id).await.unwrap();
+    assert!(response.extra.get("session_mcp_trust").is_none());
+    let options = svc.build_task_options(&row).await.unwrap();
+    let AgentSessionKind::Aionrs(context) = options.context.kind else {
+        panic!("expected aionrs runtime context");
+    };
+    assert!(context.config.session_mcp_trust.is_empty());
+}
+
+#[tokio::test]
+async fn clone_does_not_inherit_projected_session_mcp_trust_without_a_fresh_claim() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let svc = svc.with_session_mcp_trust_authority(Some(Arc::new(SessionMcpTrustAuthority::new(
+        TEST_SESSION_MCP_TRUST_KEY,
+    ))));
+    let server = test_session_mcp_server();
+    let claim = signed_session_mcp_trust_claim(&server, [9; 16]);
+    let created = svc
+        .create("user_1", session_mcp_trust_create_request(&server, &claim))
+        .await
+        .unwrap();
+    let clone_request: CloneConversationRequest = serde_json::from_value(json!({
+        "conversation": {
+            "type": "aionrs",
+            "name": "clone without authority",
+            "extra": created.extra,
+        }
+    }))
+    .unwrap();
+
+    let cloned = svc.clone_create("user_1", clone_request).await.unwrap();
+    assert!(cloned.extra.get("session_mcp_trust").is_none());
+    assert!(repo.get_verified_session_mcp_trust(&cloned.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn create_does_not_trust_caller_asserted_session_mcp_server_fields() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let server = test_session_mcp_server();
+    let mut asserted_server = serde_json::to_value(&server).unwrap();
+    asserted_server["trust"] = json!(true);
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "aionrs",
+        "extra": {
+            "workspace": ensure_test_workspace_path(),
+            "selected_session_mcp_servers": [asserted_server],
+        },
+    }))
+    .unwrap();
+
+    let created = svc.create("user_1", req).await.unwrap();
+    assert!(created.extra.get("session_mcp_trust").is_none());
+    assert!(created.extra["session_mcp_servers"][0].get("trust").is_none());
+}
+
+#[tokio::test]
+async fn create_with_session_mcp_trust_claim_fails_closed_when_authority_is_absent() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let server = test_session_mcp_server();
+    let claim = signed_session_mcp_trust_claim(&server, [4; 16]);
+
+    let error = svc
+        .create("user_1", session_mcp_trust_create_request(&server, &claim))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ConversationError::BadRequest { .. }));
+    assert!(repo.rows.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn create_rejects_malformed_forged_and_replayed_session_mcp_trust_claims() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let svc = svc.with_session_mcp_trust_authority(Some(Arc::new(SessionMcpTrustAuthority::new(
+        TEST_SESSION_MCP_TRUST_KEY,
+    ))));
+    let server = test_session_mcp_server();
+
+    let malformed = SessionMcpTrustClaim {
+        payload: "not+base64".into(),
+        signature: "also-bad".into(),
+    };
+    let malformed_error = svc
+        .create("user_1", session_mcp_trust_create_request(&server, &malformed))
+        .await
+        .unwrap_err();
+    assert!(matches!(malformed_error, ConversationError::BadRequest { .. }));
+
+    let mut forged = signed_session_mcp_trust_claim(&server, [2; 16]);
+    let mut signature = URL_SAFE_NO_PAD.decode(&forged.signature).unwrap();
+    signature[0] ^= 1;
+    forged.signature = URL_SAFE_NO_PAD.encode(signature);
+    let forged_error = svc
+        .create("user_1", session_mcp_trust_create_request(&server, &forged))
+        .await
+        .unwrap_err();
+    assert!(matches!(forged_error, ConversationError::BadRequest { .. }));
+
+    let valid = signed_session_mcp_trust_claim(&server, [3; 16]);
+    svc.create("user_1", session_mcp_trust_create_request(&server, &valid))
+        .await
+        .unwrap();
+    let replay_error = svc
+        .create("user_1", session_mcp_trust_create_request(&server, &valid))
+        .await
+        .unwrap_err();
+    assert!(matches!(replay_error, ConversationError::BadRequest { .. }));
 }
 
 #[tokio::test]
@@ -2030,6 +2350,24 @@ async fn update_extra_merge() {
 
     assert_eq!(updated.extra["workspace"], new_workspace.to_string_lossy().to_string());
     assert_eq!(updated.extra["contextFileName"], "ctx.md");
+}
+
+#[tokio::test]
+async fn update_rejects_session_mcp_trust_snapshot_and_transient_claim_fields() {
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let created = svc.create("user_1", make_create_req()).await.unwrap();
+
+    for forbidden in [
+        json!({ "session_mcp_trust": [] }),
+        json!({ "selected_session_mcp_trust_claims": [] }),
+    ] {
+        let req: UpdateConversationRequest = serde_json::from_value(json!({ "extra": forbidden })).unwrap();
+        let error = svc.update("user_1", &created.id, req, &task_mgr).await.unwrap_err();
+        match error {
+            ConversationError::BadRequest { reason } => assert!(reason.contains("immutable")),
+            other => panic!("expected immutable snapshot BadRequest, got {other:?}"),
+        }
+    }
 }
 
 #[tokio::test]
@@ -5887,6 +6225,7 @@ fn make_test_confirmations() -> Vec<Confirmation> {
             action: Some("edit_file".into()),
             description: "Edit main.rs".into(),
             command_type: Some("bash".into()),
+            mcp_identity: None,
             options: vec![],
         },
         Confirmation {
@@ -5896,6 +6235,7 @@ fn make_test_confirmations() -> Vec<Confirmation> {
             action: Some("read_file".into()),
             description: "Read config.toml".into(),
             command_type: None,
+            mcp_identity: None,
             options: vec![],
         },
     ]

@@ -24,6 +24,30 @@ pub trait IConversationRepository: Send + Sync {
     /// Inserts a new conversation row.
     async fn create(&self, row: &ConversationRow) -> Result<(), DbError>;
 
+    /// Inserts a new conversation and its Core-authenticated session MCP
+    /// trust snapshot in the same database operation. The private snapshot is
+    /// not part of [`ConversationRow`] or [`ConversationRowUpdate`], so normal
+    /// callers cannot copy or mutate it through caller-shaped fields.
+    async fn create_with_verified_session_mcp_trust(
+        &self,
+        row: &ConversationRow,
+        verified_session_mcp_trust: Option<&str>,
+    ) -> Result<(), DbError> {
+        if verified_session_mcp_trust.is_some() {
+            return Err(DbError::Init(
+                "conversation repository does not support verified session MCP trust".into(),
+            ));
+        }
+        self.create(row).await
+    }
+
+    /// Loads the private Core-authenticated session MCP trust snapshot.
+    /// Implementations that predate the private column fail closed to no
+    /// trust.
+    async fn get_verified_session_mcp_trust(&self, _id: &str) -> Result<Option<String>, DbError> {
+        Ok(None)
+    }
+
     /// Partially updates a conversation. Returns `DbError::NotFound` if ID is missing.
     async fn update(&self, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError>;
 

@@ -148,7 +148,7 @@ impl McpOAuthService {
         };
 
         // Open browser.
-        debug!(url = %authorize_url, "Opening browser for OAuth authorization");
+        debug!(server_url, "Opening browser for OAuth authorization");
         if let Err(e) = open::that(&authorize_url) {
             warn!("Failed to open browser: {e}");
         }
@@ -208,7 +208,8 @@ impl McpOAuthService {
     ///
     /// If the stored token is expired and a refresh token is available,
     /// automatically refreshes before returning.
-    /// Returns `None` if no token is stored for this URL.
+    /// Returns `None` if no token is stored or safe refresh is impossible, so
+    /// callers can require reauthentication without sending stale bytes.
     pub async fn get_token(&self, server_url: &str) -> Result<Option<String>, McpError> {
         let row = match self.token_repo.get_by_url(server_url).await? {
             Some(row) => row,
@@ -218,17 +219,28 @@ impl McpOAuthService {
         // Check if token is expired (with safety margin).
         if let Some(expires_at) = row.expires_at {
             let now = now_ms();
-            if now >= expires_at - EXPIRY_MARGIN_MS
-                && let Some(ref refresh_token) = row.refresh_token
-            {
-                match self.refresh_token(server_url, refresh_token).await {
+            if now >= expires_at.saturating_sub(EXPIRY_MARGIN_MS) {
+                let Some(ref refresh_token) = row.refresh_token else {
+                    warn!(
+                        server_url,
+                        reason = "missing_refresh_token",
+                        "OAuth reauthentication required"
+                    );
+                    return Ok(None);
+                };
+                let Some(ref client_id) = row.client_id else {
+                    warn!(
+                        server_url,
+                        reason = "missing_client_id",
+                        "OAuth reauthentication required"
+                    );
+                    return Ok(None);
+                };
+                match self.refresh_token(server_url, refresh_token, client_id).await {
                     Ok(new_token) => return Ok(Some(new_token)),
-                    Err(e) => {
-                        warn!(
-                            server_url,
-                            error = %e,
-                            "Token refresh failed, returning expired token"
-                        );
+                    Err(_) => {
+                        warn!(server_url, reason = "refresh_failed", "OAuth reauthentication required");
+                        return Ok(None);
                     }
                 }
             }
@@ -267,7 +279,8 @@ impl McpOAuthService {
     /// Return the `Authorization` header value (`"Bearer <token>"`) for
     /// `server_url` if an OAuth token is stored, refreshing it if expired.
     ///
-    /// Returns `None` when no token is stored or a lookup error occurs (logged).
+    /// Returns `None` when no usable token is available or a lookup error
+    /// occurs (logged).
     /// This is the shared building block for attaching the stored token to any
     /// MCP connection — the connection test (via [`Self::inject_authorization`])
     /// and the ACP/native tool-use paths that build their own header types.
@@ -412,10 +425,7 @@ impl McpOAuthService {
 
         // Prefer the pointer from the WWW-Authenticate challenge (RFC 9728).
         if let Ok(resp) = self.http_client.get(server_url).send().await
-            && let Some(header) = resp
-                .headers()
-                .get("www-authenticate")
-                .and_then(|v| v.to_str().ok())
+            && let Some(header) = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok())
             && let Some(url) = parse_resource_metadata_pointer(header)
         {
             prm_urls.push(url);
@@ -477,7 +487,9 @@ impl McpOAuthService {
         if !resp.status().is_success() {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
-            return Err(McpError::OAuth(format!("Client registration returned {status}: {detail}")));
+            return Err(McpError::OAuth(format!(
+                "Client registration returned {status}: {detail}"
+            )));
         }
 
         let registration: ClientRegistrationResponse = resp
@@ -598,7 +610,7 @@ impl McpOAuthService {
             RedirectUrl::new(redirect_url_str).map_err(|e| McpError::OAuth(format!("Invalid redirect URL: {e}")))?;
 
         // Exchange with the same client ID the authorization was issued to.
-        let client = BasicClient::new(ClientId::new(client_id))
+        let client = BasicClient::new(ClientId::new(client_id.clone()))
             .set_auth_uri(auth_url)
             .set_token_uri(token_url)
             .set_redirect_uri(redirect);
@@ -612,23 +624,23 @@ impl McpOAuthService {
             .await
             .map_err(|e| McpError::OAuth(format!("Token exchange failed: {e}")))?;
 
-        self.persist_token(server_url, &token_result).await?;
+        self.persist_token(server_url, &token_result, &client_id).await?;
         debug!(server_url, "OAuth tokens stored successfully");
         Ok(())
     }
 
     /// Refresh an expired access token using the refresh token.
-    async fn refresh_token(&self, server_url: &str, refresh_token_value: &str) -> Result<String, McpError> {
+    async fn refresh_token(
+        &self,
+        server_url: &str,
+        refresh_token_value: &str,
+        client_id: &str,
+    ) -> Result<String, McpError> {
         let metadata = self.discover_endpoints(server_url).await?;
         let token_url =
             TokenUrl::new(metadata.token_endpoint).map_err(|e| McpError::OAuth(format!("Invalid token URL: {e}")))?;
 
-        // NOTE: dynamically registered client IDs are not yet persisted, so
-        // refresh uses the default client ID. Public-client refresh usually
-        // succeeds on the refresh token alone; when a server binds refresh to a
-        // registered client the caller falls back to the stored token (see
-        // `get_token`). Persisting the client ID is a follow-up.
-        let client = BasicClient::new(ClientId::new(DEFAULT_CLIENT_ID.to_string())).set_token_uri(token_url);
+        let client = BasicClient::new(ClientId::new(client_id.to_string())).set_token_uri(token_url);
 
         let http_client = Self::build_no_redirect_client()?;
 
@@ -654,6 +666,7 @@ impl McpOAuthService {
                 server_url,
                 access_token: &new_access_token,
                 refresh_token: Some(new_refresh),
+                client_id: Some(client_id),
                 token_type: "bearer",
                 expires_at,
             })
@@ -664,7 +677,12 @@ impl McpOAuthService {
     }
 
     /// Persist token response to DB.
-    async fn persist_token<TR: TokenResponse>(&self, server_url: &str, token_result: &TR) -> Result<(), McpError> {
+    async fn persist_token<TR: TokenResponse>(
+        &self,
+        server_url: &str,
+        token_result: &TR,
+        client_id: &str,
+    ) -> Result<(), McpError> {
         let expires_at: Option<TimestampMs> = token_result.expires_in().map(|d| now_ms() + d.as_millis() as i64);
 
         self.token_repo
@@ -672,6 +690,7 @@ impl McpOAuthService {
                 server_url,
                 access_token: token_result.access_token().secret(),
                 refresh_token: token_result.refresh_token().map(|t| t.secret().as_str()),
+                client_id: Some(client_id),
                 token_type: "bearer",
                 expires_at,
             })
@@ -842,6 +861,9 @@ fn url_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aionui_db::SqliteOAuthTokenRepository;
+    use oauth2::basic::{BasicTokenResponse, BasicTokenType};
+    use oauth2::{AccessToken, EmptyExtraTokenFields};
 
     // -- inject_authorization -------------------------------------------------
 
@@ -856,7 +878,10 @@ mod tests {
         let McpServerTransport::Http { headers, .. } = &transport else {
             panic!("expected http transport");
         };
-        assert_eq!(headers.get("Authorization").map(String::as_str), Some("Bearer valid_access_token"));
+        assert_eq!(
+            headers.get("Authorization").map(String::as_str),
+            Some("Bearer valid_access_token")
+        );
     }
 
     #[tokio::test]
@@ -870,7 +895,10 @@ mod tests {
         let McpServerTransport::Sse { headers, .. } = &transport else {
             panic!("expected sse transport");
         };
-        assert_eq!(headers.get("Authorization").map(String::as_str), Some("Bearer valid_access_token"));
+        assert_eq!(
+            headers.get("Authorization").map(String::as_str),
+            Some("Bearer valid_access_token")
+        );
     }
 
     #[tokio::test]
@@ -879,13 +907,22 @@ mod tests {
         let mut headers = std::collections::HashMap::new();
         // Case-insensitive match: a user-supplied static PAT must not be clobbered.
         headers.insert("authorization".to_string(), "Bearer user_pat".to_string());
-        let mut transport = McpServerTransport::Http { url: "https://example.com".to_string(), headers };
+        let mut transport = McpServerTransport::Http {
+            url: "https://example.com".to_string(),
+            headers,
+        };
         svc.inject_authorization(&mut transport).await;
         let McpServerTransport::Http { headers, .. } = &transport else {
             panic!("expected http transport");
         };
-        assert_eq!(headers.get("authorization").map(String::as_str), Some("Bearer user_pat"));
-        assert!(!headers.contains_key("Authorization"), "must not add a second Authorization header");
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some("Bearer user_pat")
+        );
+        assert!(
+            !headers.contains_key("Authorization"),
+            "must not add a second Authorization header"
+        );
     }
 
     #[tokio::test]
@@ -998,8 +1035,14 @@ mod tests {
 
     #[test]
     fn origin_of_strips_path() {
-        assert_eq!(origin_of("https://github.com/login/oauth").unwrap(), "https://github.com");
-        assert_eq!(origin_of("https://mcp.atlassian.com/v1/sse").unwrap(), "https://mcp.atlassian.com");
+        assert_eq!(
+            origin_of("https://github.com/login/oauth").unwrap(),
+            "https://github.com"
+        );
+        assert_eq!(
+            origin_of("https://mcp.atlassian.com/v1/sse").unwrap(),
+            "https://mcp.atlassian.com"
+        );
         assert_eq!(origin_of("https://host:8443/a/b").unwrap(), "https://host:8443");
         assert_eq!(origin_of("https://github.com").unwrap(), "https://github.com");
         assert!(origin_of("not-a-url").is_none());
@@ -1060,6 +1103,26 @@ mod tests {
         let http = reqwest::Client::new();
         let svc = McpOAuthService::new(repo, http);
         let _clone = svc.clone();
+    }
+
+    #[tokio::test]
+    async fn persist_token_stores_authorizing_client_identity() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let repo = Arc::new(SqliteOAuthTokenRepository::new(db.pool().clone()));
+        let svc = McpOAuthService::new(repo.clone(), reqwest::Client::new());
+        let mut token = BasicTokenResponse::new(
+            AccessToken::new("access-token".to_string()),
+            BasicTokenType::Bearer,
+            EmptyExtraTokenFields {},
+        );
+        token.set_refresh_token(Some(RefreshToken::new("refresh-token".to_string())));
+
+        svc.persist_token("https://dynamic.example.com", &token, "dynamic-client")
+            .await
+            .unwrap();
+
+        let stored = repo.get_by_url("https://dynamic.example.com").await.unwrap().unwrap();
+        assert_eq!(stored.client_id.as_deref(), Some("dynamic-client"));
     }
 
     // -- Mock repositories ---------------------------------------------------
@@ -1123,6 +1186,7 @@ mod tests {
                 server_url: "https://example.com".to_string(),
                 access_token: "valid_access_token".to_string(),
                 refresh_token: None,
+                client_id: None,
                 token_type: "bearer".to_string(),
                 expires_at: Some(now_ms() + 3_600_000),
                 created_at: now_ms(),
@@ -1155,8 +1219,42 @@ mod tests {
                 server_url: "https://example.com".to_string(),
                 access_token: "expired_token".to_string(),
                 refresh_token: None,
+                client_id: None,
                 token_type: "bearer".to_string(),
                 expires_at: Some(1000),
+                created_at: 500,
+                updated_at: 500,
+            }))
+        }
+
+        async fn upsert(
+            &self,
+            _: UpsertOAuthTokenParams<'_>,
+        ) -> Result<aionui_db::models::OAuthTokenRow, aionui_db::DbError> {
+            unimplemented!()
+        }
+
+        async fn delete(&self, _: &str) -> Result<(), aionui_db::DbError> {
+            Ok(())
+        }
+
+        async fn list_authenticated_urls(&self) -> Result<Vec<String>, aionui_db::DbError> {
+            Ok(vec![])
+        }
+    }
+
+    struct CorruptExpiryTokenRepo;
+
+    #[async_trait::async_trait]
+    impl IOAuthTokenRepository for CorruptExpiryTokenRepo {
+        async fn get_by_url(&self, _: &str) -> Result<Option<aionui_db::models::OAuthTokenRow>, aionui_db::DbError> {
+            Ok(Some(aionui_db::models::OAuthTokenRow {
+                server_url: "https://example.com".to_string(),
+                access_token: "corrupt_expiry_token".to_string(),
+                refresh_token: None,
+                client_id: None,
+                token_type: "bearer".to_string(),
+                expires_at: Some(i64::MIN),
                 created_at: 500,
                 updated_at: 500,
             }))
@@ -1187,6 +1285,7 @@ mod tests {
                 server_url: "https://example.com".to_string(),
                 access_token: "no_expiry_token".to_string(),
                 refresh_token: None,
+                client_id: None,
                 token_type: "bearer".to_string(),
                 expires_at: None,
                 created_at: now_ms(),
@@ -1275,10 +1374,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_token_returns_expired_when_no_refresh() {
+    async fn get_token_requires_reauthentication_when_expired_without_refresh() {
         let svc = McpOAuthService::new(Arc::new(ExpiredTokenRepo), reqwest::Client::new());
-        // Expired token with no refresh_token: returns the expired token as-is.
         let token = svc.get_token("https://example.com").await.unwrap();
-        assert_eq!(token.as_deref(), Some("expired_token"));
+        assert_eq!(token, None);
+    }
+
+    #[tokio::test]
+    async fn get_token_fails_closed_for_extreme_expiry_timestamp() {
+        let svc = McpOAuthService::new(Arc::new(CorruptExpiryTokenRepo), reqwest::Client::new());
+        let token = svc.get_token("https://example.com").await.unwrap();
+        assert_eq!(token, None);
     }
 }

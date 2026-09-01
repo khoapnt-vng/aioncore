@@ -95,6 +95,7 @@ impl AcpPermissionRequestData {
                 AcpToolCallKind::Edit => "edit".to_owned(),
                 AcpToolCallKind::Execute => "execute".to_owned(),
             }),
+            mcp_identity: None,
             options: self
                 .options
                 .iter()

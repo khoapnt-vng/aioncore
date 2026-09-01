@@ -17,7 +17,7 @@ static RUNTIME_ROOT_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 /// the first value wins); a warning is logged if a second path is
 /// attempted so unexpected double-inits are visible.
 pub fn init(data_dir: impl AsRef<Path>) {
-    let path = data_dir.as_ref().join("runtime");
+    let path = anchor_data_dir(data_dir.as_ref()).join("runtime");
     if let Err(existing) = RUNTIME_ROOT_OVERRIDE.set(path.clone())
         && existing != path
     {
@@ -27,6 +27,16 @@ pub fn init(data_dir: impl AsRef<Path>) {
             "aionui_runtime::init called twice with different paths; keeping first"
         );
     }
+}
+
+fn anchor_data_dir(data_dir: &Path) -> PathBuf {
+    if data_dir.is_absolute() {
+        return data_dir.to_path_buf();
+    }
+
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(data_dir))
+        .unwrap_or_else(|_| data_dir.to_path_buf())
 }
 
 /// Returns the root cache directory used for all aionui runtime artifacts.
@@ -59,6 +69,14 @@ pub fn managed_acp_tool_root() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_data_dir_is_anchored_before_runtime_paths_are_derived() {
+        let anchored = anchor_data_dir(Path::new("data"));
+
+        assert!(anchored.is_absolute());
+        assert_eq!(anchored.file_name().and_then(|name| name.to_str()), Some("data"));
+    }
 
     #[test]
     fn runtime_root_ends_with_expected_suffix() {

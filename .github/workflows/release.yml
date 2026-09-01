@@ -3,221 +3,347 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "v0.1.55"
   workflow_call:
     inputs:
       tag_name:
-        description: "Release tag to build and publish (e.g., v0.2.0)"
+        description: "Exact internal release tag"
         required: true
         type: string
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag to build and publish (e.g., v0.2.0)"
+        description: "Exact internal release tag"
         required: true
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 env:
-  BINARY_NAME: aioncore
   CARGO_TERM_COLOR: always
   CARGO_HTTP_TIMEOUT: "600"
   CARGO_NET_RETRY: "10"
-  # cross commit used by the v0.1.39/v0.1.40 Linux ARM64 release builds.
-  CROSS_GIT_REV: "29d00c7803f221f1b3f35e561b03792368fb8339"
-  LINUX_X64_GLIBC_MAX: "GLIBC_2.34"
-  LINUX_ARM64_GLIBC_MAX: "GLIBC_2.30"
   RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
+  RELEASE_BRANCH: security/pilot-hardening-d01-d06
 
 jobs:
   prepare-release:
-    name: Prepare Release Metadata
+    name: Bind immutable release metadata
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.metadata.outputs.version }}
+      tag_commit: ${{ steps.metadata.outputs.tag_commit }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          fetch-depth: 0
           ref: refs/tags/${{ env.RELEASE_TAG }}
 
-      - name: Extract version from tag
+      - name: Verify exact annotated tag, version, and merged commit
         id: metadata
         shell: bash
         run: |
-          version="${RELEASE_TAG#v}"
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          test "${RELEASE_TAG}" = "v0.1.55" || {
+            echo "::error::Only the approved v0.1.55 internal release is permitted"
+            exit 1
+          }
+          workspace_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          test "${workspace_version}" = "0.1.55" || {
+            echo "::error::Workspace version is ${workspace_version}, expected 0.1.55"
+            exit 1
+          }
+          git fetch --no-tags origin \
+            "refs/heads/${RELEASE_BRANCH}:refs/remotes/origin/${RELEASE_BRANCH}"
+          tag_type="$(git cat-file -t "refs/tags/${RELEASE_TAG}")"
+          test "${tag_type}" = "tag" || {
+            echo "::error::${RELEASE_TAG} must be an annotated tag"
+            exit 1
+          }
+          head_commit="$(git rev-parse HEAD)"
+          tag_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{}")"
+          test "${head_commit}" = "${tag_commit}" || {
+            echo "::error::Checked-out commit does not equal the peeled tag commit"
+            exit 1
+          }
+          git merge-base --is-ancestor "${tag_commit}" "origin/${RELEASE_BRANCH}" || {
+            echo "::error::${RELEASE_TAG} must point to a commit merged into ${RELEASE_BRANCH}"
+            exit 1
+          }
+          echo "version=${workspace_version}" >> "$GITHUB_OUTPUT"
+          echo "tag_commit=${tag_commit}" >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build ${{ matrix.target }}
+    name: Build and verify ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     needs: prepare-release
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64: build natively on ubuntu-22.04 (GLIBC 2.35) so the
-          # release binary runs on Debian 12 / Ubuntu 22.04+ / RHEL 9 /
-          # CentOS Stream 9. We cannot use `cross` here because the default
-          # cross docker image ships a gcc that aws-lc-sys's memcmp safety
-          # check rejects. Pinning the runner is simpler and covers the
-          # target audience — Debian 11 (GLIBC 2.31) is entering ELTS so we
-          # deliberately drop it.
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            binary_name: aioncore
-          # Linux aarch64: keep `cross` (its image happens to not trip the
-          # aws-lc-sys check and also yields an older GLIBC baseline).
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            binary_name: aioncore
-            use_cross: true
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            binary_name: aioncore
           - os: macos-latest
             target: aarch64-apple-darwin
             binary_name: aioncore
+            archive_kind: tar
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             binary_name: aioncore.exe
-            rustflags: "-C target-feature=+crt-static"
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            binary_name: aioncore.exe
+            archive_kind: zip
             rustflags: "-C target-feature=+crt-static"
 
     steps:
-      - uses: actions/checkout@v6
+      - name: Configure LF checkout on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          fetch-depth: 0
           ref: refs/tags/${{ env.RELEASE_TAG }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: "1.95.0"
           targets: ${{ matrix.target }}
 
-      - name: Fix MSVC linker (remove Git's link.exe)
+      - name: Fix MSVC linker resolution
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Remove-Item 'C:\Program Files\Git\usr\bin\link.exe' -Force -ErrorAction SilentlyContinue
+        run: Remove-Item 'C:\Program Files\Git\usr\bin\link.exe' -ErrorAction SilentlyContinue
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          # Include runner OS image and cross baseline in the cache key.
-          # Proc-macro .so files link against the host GLIBC, so switching
-          # the runner (ubuntu-24.04 ↔ 22.04) or flipping native ↔ cross
-          # must fall into a different cache bucket — otherwise the cached
-          # .so is loaded against an incompatible GLIBC and cargo panics
-          # with "can't find crate" / "GLIBC_* not found" errors.
-          shared-key: release-${{ matrix.target }}-${{ matrix.os }}${{ matrix.target == 'x86_64-unknown-linux-gnu' && format('-glibc-{0}', env.LINUX_X64_GLIBC_MAX) || '' }}${{ matrix.use_cross == true && format('-cross-{0}-glibc-{1}', env.CROSS_GIT_REV, env.LINUX_ARM64_GLIBC_MAX) || '' }}
+          shared-key: internal-v0.1.55-${{ matrix.target }}-${{ matrix.os }}
 
-      - name: Verify pinned Linux ARM64 cross image is available
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: docker pull ghcr.io/cross-rs/aarch64-unknown-linux-gnu@sha256:99e041b94e7d4f31477c6ddede176688562c3762ba3833b75de3316100afc39d
+      - name: Verify migration lineage
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/migration/generate-lineage.py \
+            --migrations crates/aionui-db/migrations \
+            --check migration-lineage.json
 
-      - name: Install cross (Linux targets)
-        if: matrix.use_cross == true
-        run: cargo install cross --git https://github.com/cross-rs/cross --rev "${CROSS_GIT_REV}" --locked
+      - name: Capture tool versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          {
+            rustc --version --verbose
+            cargo --version
+            python3 --version
+            node --version
+            uname -a || true
+          } > evidence/tool-versions.txt 2>&1
 
-      - name: Build release binary
+      - name: Build native release binary
         shell: bash
         env:
           RUSTFLAGS: ${{ matrix.rustflags || '' }}
         run: |
-          if [[ -n "${RUSTFLAGS:-}" ]]; then
-            echo "Using RUSTFLAGS=${RUSTFLAGS}"
-          fi
+          set -euo pipefail
           if [[ "${RUNNER_OS:-}" == "Windows" ]]; then
-            # openssl-src's ./Configure needs a Perl with Locale::Maketext::Simple.
-            # Under `shell: bash` the Git-for-Windows MSYS perl wins the PATH and
-            # lacks it, so point openssl-src at the runner's Strawberry Perl.
             test -f "/c/Strawberry/perl/bin/perl.exe" || {
-              echo "::error::Strawberry Perl not found at C:/Strawberry/perl/bin/perl.exe — OpenSSL cannot be configured"
+              echo "::error::Strawberry Perl is required for the Windows OpenSSL build"
               exit 1
             }
             export OPENSSL_SRC_PERL="C:/Strawberry/perl/bin/perl.exe"
           fi
-          if [[ "${{ matrix.use_cross }}" == "true" ]]; then
-            cross build --release --target ${{ matrix.target }} -p aionui-app
-          else
-            cargo build --release --target ${{ matrix.target }} -p aionui-app
-          fi
+          cargo build --locked --release --target "${{ matrix.target }}" -p aionui-app \
+            2>&1 | tee evidence/build.log
 
-      - name: Verify Linux ARM64 GLIBC baseline
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Prepare complete managed resources
         shell: bash
-        run: scripts/check-glibc-baseline.sh "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "${LINUX_ARM64_GLIBC_MAX}"
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
+          test -f "${binary}"
+          "${binary}" \
+            --data-dir "${PWD}/work/release-data" \
+            prepare-managed-resources \
+            --bundle-out "${PWD}/work/managed-resources" \
+            2>&1 | tee evidence/prepare-managed-resources.log
 
-      - name: Verify Linux x64 GLIBC baseline
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+      - name: Add pinned OfficeCLI to managed resources
         shell: bash
-        run: scripts/check-glibc-baseline.sh "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "${LINUX_X64_GLIBC_MAX}"
+        run: |
+          set -euo pipefail
+          python3 scripts/release/prepare_officecli.py \
+            --managed-resources work/managed-resources \
+            --target "${{ matrix.target }}" \
+            2>&1 | tee evidence/prepare-officecli.log
 
-      - name: Package binary (Unix)
-        if: runner.os != 'Windows'
+      - name: Assemble and verify complete bundle
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ needs.prepare-release.outputs.tag_commit }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          built_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          python3 scripts/release/assemble_bundle.py \
+            --binary "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" \
+            --lineage migration-lineage.json \
+            --managed-resources work/managed-resources \
+            --output work/bundle \
+            --repository khoapnt-vng/aioncore \
+            --version "${VERSION}" \
+            --source-commit "${SOURCE_COMMIT}" \
+            --target "${{ matrix.target }}" \
+            --built-at "${built_at}"
+          {
+            echo "verify assembled bundle"
+            python3 scripts/release/verify_bundle.py \
+              --bundle work/bundle \
+              --repository khoapnt-vng/aioncore \
+              --version "${VERSION}" \
+              --source-commit "${SOURCE_COMMIT}" \
+              --target "${{ matrix.target }}"
+          } 2>&1 | tee evidence/verify-assembled.log
+
+      - name: Archive bundle on macOS
+        if: matrix.archive_kind == 'tar'
         shell: bash
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
         run: |
+          set -euo pipefail
           mkdir -p dist
           ARCHIVE="aioncore-v${VERSION}-${{ matrix.target }}.tar.gz"
-          tar -C target/${{ matrix.target }}/release -czf "dist/${ARCHIVE}" ${{ matrix.binary_name }}
+          test ! -e "dist/${ARCHIVE}"
+          tar -C work/bundle -czf "dist/${ARCHIVE}" .
           echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
 
-      - name: Package binary (Windows)
-        if: runner.os == 'Windows'
+      - name: Archive bundle on Windows
+        if: matrix.archive_kind == 'zip'
         shell: pwsh
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          New-Item -ItemType Directory -Path dist | Out-Null
           $archive = "aioncore-v${env:VERSION}-${{ matrix.target }}.zip"
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" -DestinationPath "dist/${archive}" -Force
+          if (Test-Path "dist/${archive}") { throw "archive already exists: ${archive}" }
+          Compress-Archive -Path "work/bundle/*" -DestinationPath "dist/${archive}"
           "ARCHIVE=${archive}" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Upload release artifact
-        uses: actions/upload-artifact@v7
+      - name: Extract archived bundle on macOS
+        if: matrix.archive_kind == 'tar'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir work/extracted
+          tar -xzf "dist/${ARCHIVE}" -C work/extracted
+
+      - name: Extract archived bundle on Windows
+        if: matrix.archive_kind == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path work/extracted | Out-Null
+          Expand-Archive -Path "dist/${env:ARCHIVE}" -DestinationPath work/extracted
+
+      - name: Verify freshly extracted archive
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ needs.prepare-release.outputs.tag_commit }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "verify freshly extracted archive"
+            python3 scripts/release/verify_bundle.py \
+              --bundle work/extracted \
+              --repository khoapnt-vng/aioncore \
+              --version "${VERSION}" \
+              --source-commit "${SOURCE_COMMIT}" \
+              --target "${{ matrix.target }}"
+          } 2>&1 | tee evidence/verify-extracted.log
+
+      - name: Upload immutable release archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ${{ matrix.target }}
+          name: release-${{ matrix.target }}
           path: dist/${{ env.ARCHIVE }}
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: evidence-${{ matrix.target }}
+          path: |
+            work/bundle/bundle-manifest.json
+            work/bundle/SHA256SUMS
+            work/extracted/bundle-manifest.json
+            evidence/build.log
+            evidence/prepare-managed-resources.log
+            evidence/prepare-officecli.log
+            evidence/verify-assembled.log
+            evidence/verify-extracted.log
+            evidence/tool-versions.txt
+          if-no-files-found: error
+          retention-days: 90
 
   github-release:
-    name: Upload GitHub Release assets
+    name: Create immutable unsigned GitHub release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     needs:
       - prepare-release
       - build
     steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@v8
+      - name: Download only final archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
+          pattern: release-*
           path: artifacts
           merge-multiple: true
 
-      - name: Generate checksums
+      - name: Validate archive set and generate checksums
         shell: bash
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
         run: |
-          cd artifacts
-          sha256sum aioncore-* > aioncore-checksums.txt
+          set -euo pipefail
+          test -f "artifacts/aioncore-v${VERSION}-aarch64-apple-darwin.tar.gz"
+          test -f "artifacts/aioncore-v${VERSION}-x86_64-pc-windows-msvc.zip"
+          archive_count="$(find artifacts -maxdepth 1 -type f -name 'aioncore-*' | wc -l | tr -d ' ')"
+          test "${archive_count}" = "2"
+          test ! -e artifacts/aioncore-checksums.txt
+          (
+            cd artifacts
+            sha256sum \
+              "aioncore-v${VERSION}-aarch64-apple-darwin.tar.gz" \
+              "aioncore-v${VERSION}-x86_64-pc-windows-msvc.zip" \
+              > aioncore-checksums.txt
+          )
 
-      - name: Upload release assets
+      - name: Fail if the release already exists
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
           REPOSITORY: ${{ github.repository }}
         run: |
-          release_url="https://github.com/${REPOSITORY}/releases/tag/${RELEASE_TAG}"
+          set -euo pipefail
           if gh release view "${RELEASE_TAG}" --repo "${REPOSITORY}" > /dev/null 2>&1; then
-            gh release upload "${RELEASE_TAG}" artifacts/* --repo "${REPOSITORY}" --clobber
-          else
-            gh release create "${RELEASE_TAG}" artifacts/* \
-              --repo "${REPOSITORY}" \
-              --title "${RELEASE_TAG}" \
-              --generate-notes
+            echo "::error::Release ${RELEASE_TAG} already exists; assets are immutable"
+            exit 1
           fi
-          echo "Uploaded assets to ${release_url}"
+
+      - name: Create unsigned internal release once
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release create "${RELEASE_TAG}" \
+            "artifacts/aioncore-v0.1.55-aarch64-apple-darwin.tar.gz" \
+            "artifacts/aioncore-v0.1.55-x86_64-pc-windows-msvc.zip" \
+            "artifacts/aioncore-checksums.txt" \
+            --repo "${REPOSITORY}" \
+            --title "${RELEASE_TAG} internal unsigned" \
+            --notes "Internal unsigned AionCore release for WePrompt Sprint 3. Manual distribution only."

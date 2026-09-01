@@ -3,11 +3,12 @@ use std::sync::Arc;
 
 use aion_agent::session::SessionManager;
 use aion_config::compat::OpenAiApiMode;
-use aion_config::config::{McpServerConfig, TransportType};
+use aion_config::config::{McpServerConfig, McpServerTrust, TransportType};
 use aion_types::message::ImageInputCapability;
 use aionui_api_types::{
-    AionrsBuildExtra, ModelImageInputCapability, ModelOpenAiApiMode, ModelSettings, SessionMcpServer,
-    SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
+    AionrsBuildExtra, ModelImageInputCapability, ModelOpenAiApiMode, ModelSettings, SESSION_MCP_RESOLVER_PROFILE_V1,
+    SessionMcpServer, SessionMcpTransport, SessionMcpTrustSnapshot, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
+    session_mcp_server_fingerprint,
 };
 use aionui_common::ProviderWithModel;
 use aionui_db::IMcpServerRepository;
@@ -65,6 +66,7 @@ pub(super) async fn build(
     merge_session_snapshot_mcp_servers(
         &mut extra_mcp_servers,
         &overrides.session_mcp_servers,
+        &overrides.session_mcp_trust,
         &ctx.conversation_id,
         deps.broadcaster.clone(),
     )
@@ -558,6 +560,7 @@ async fn row_to_mcp_server_config(
                 ensure_stdio_launch(command, &args, &env_entries, conversation_id, broadcaster).await?;
 
             Ok(McpServerConfig {
+                trust: McpServerTrust::Untrusted,
                 transport: TransportType::Stdio,
                 command: Some(resolved_command),
                 args: Some(args),
@@ -584,6 +587,7 @@ async fn row_to_mcp_server_config(
                 .unwrap_or_default();
 
             Ok(McpServerConfig {
+                trust: McpServerTrust::Untrusted,
                 transport: TransportType::StreamableHttp,
                 command: None,
                 args: None,
@@ -610,6 +614,7 @@ async fn row_to_mcp_server_config(
                 .unwrap_or_default();
 
             Ok(McpServerConfig {
+                trust: McpServerTrust::Untrusted,
                 transport: TransportType::Sse,
                 command: None,
                 args: None,
@@ -638,6 +643,7 @@ async fn session_server_to_mcp_server_config(
             let (command, args, env) =
                 ensure_stdio_launch(command, args, &entries, conversation_id, broadcaster).await?;
             Ok(McpServerConfig {
+                trust: McpServerTrust::Untrusted,
                 transport: TransportType::Stdio,
                 command: Some(command),
                 args: Some(args),
@@ -653,6 +659,7 @@ async fn session_server_to_mcp_server_config(
                 return Err("http: missing url".to_owned());
             }
             Ok(McpServerConfig {
+                trust: McpServerTrust::Untrusted,
                 transport: TransportType::StreamableHttp,
                 command: None,
                 args: None,
@@ -668,6 +675,7 @@ async fn session_server_to_mcp_server_config(
                 return Err("sse: missing url".to_owned());
             }
             Ok(McpServerConfig {
+                trust: McpServerTrust::Untrusted,
                 transport: TransportType::Sse,
                 command: None,
                 args: None,
@@ -683,6 +691,7 @@ async fn session_server_to_mcp_server_config(
                 return Err("streamable_http: missing url".to_owned());
             }
             Ok(McpServerConfig {
+                trust: McpServerTrust::Untrusted,
                 transport: TransportType::StreamableHttp,
                 command: None,
                 args: None,
@@ -699,12 +708,16 @@ async fn session_server_to_mcp_server_config(
 async fn merge_session_snapshot_mcp_servers(
     extra_mcp_servers: &mut HashMap<String, McpServerConfig>,
     session_mcp_servers: &[SessionMcpServer],
+    session_mcp_trust: &[SessionMcpTrustSnapshot],
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
 ) {
     for server in session_mcp_servers {
         match session_server_to_mcp_server_config(server, conversation_id, broadcaster.clone()).await {
-            Ok(config) => {
+            Ok(mut config) => {
+                if has_exact_session_mcp_trust(server, session_mcp_servers, session_mcp_trust) {
+                    config.trust = McpServerTrust::HostAuthenticated;
+                }
                 if extra_mcp_servers.insert(server.name.clone(), config).is_some() {
                     debug!(
                         conversation_id = %conversation_id,
@@ -724,6 +737,29 @@ async fn merge_session_snapshot_mcp_servers(
             }
         }
     }
+}
+
+fn has_exact_session_mcp_trust(
+    server: &SessionMcpServer,
+    session_mcp_servers: &[SessionMcpServer],
+    session_mcp_trust: &[SessionMcpTrustSnapshot],
+) -> bool {
+    let fingerprint = session_mcp_server_fingerprint(server);
+    session_mcp_servers
+        .iter()
+        .filter(|candidate| candidate.id == server.id)
+        .count()
+        == 1
+        && session_mcp_trust
+            .iter()
+            .filter(|snapshot| snapshot.server_id == server.id)
+            .count()
+            == 1
+        && session_mcp_trust.iter().any(|snapshot| {
+            snapshot.server_id == server.id
+                && snapshot.server_fingerprint == fingerprint
+                && snapshot.resolver_profile == SESSION_MCP_RESOLVER_PROFILE_V1
+        })
 }
 
 async fn ensure_stdio_launch(
@@ -770,6 +806,7 @@ fn team_mcp_to_config(cfg: &TeamMcpStdioConfig) -> HashMap<String, McpServerConf
     env.insert(TeamMcpStdioConfig::ENV_SLOT_ID.into(), cfg.slot_id.clone());
 
     let server = McpServerConfig {
+        trust: McpServerTrust::Untrusted,
         transport: TransportType::Stdio,
         command: Some(cfg.binary_path.clone()),
         args: Some(vec!["mcp-team-stdio".into()]),
@@ -814,6 +851,7 @@ mod tests {
                 server_url: server_url.to_owned(),
                 access_token: t.clone(),
                 refresh_token: None,
+                client_id: None,
                 token_type: "bearer".to_owned(),
                 expires_at: None,
                 created_at: 0,
@@ -836,6 +874,7 @@ mod tests {
 
     fn http_config(url: &str, headers: Option<HashMap<String, String>>) -> McpServerConfig {
         McpServerConfig {
+            trust: McpServerTrust::Untrusted,
             transport: TransportType::StreamableHttp,
             command: None,
             args: None,
@@ -867,16 +906,20 @@ mod tests {
         pat.insert("authorization".to_owned(), "Bearer user_pat".to_owned());
         let mut servers = HashMap::from([
             ("gh".to_owned(), http_config("https://api.example.com/mcp", Some(pat))),
-            ("local".to_owned(), McpServerConfig {
-                transport: TransportType::Stdio,
-                command: Some("echo".into()),
-                args: None,
-                env: None,
-                url: None,
-                headers: None,
-                deferred: Some(false),
-                startup_timeout_ms: None,
-            }),
+            (
+                "local".to_owned(),
+                McpServerConfig {
+                    trust: McpServerTrust::Untrusted,
+                    transport: TransportType::Stdio,
+                    command: Some("echo".into()),
+                    args: None,
+                    env: None,
+                    url: None,
+                    headers: None,
+                    deferred: Some(false),
+                    startup_timeout_ms: None,
+                },
+            ),
         ]);
         inject_oauth_headers(&mut servers, &oauth, "conv-1").await;
         let gh = servers["gh"].headers.as_ref().unwrap();
@@ -1910,6 +1953,7 @@ mod tests {
         let mut servers = HashMap::from([(
             "demo-mcp".to_owned(),
             McpServerConfig {
+                trust: McpServerTrust::Untrusted,
                 transport: TransportType::Stdio,
                 command: Some("npx".into()),
                 args: Some(vec!["-y".into(), "@old/server".into()]),
@@ -1930,11 +1974,17 @@ mod tests {
                 env: HashMap::from([("TOKEN".into(), "abc".into())]),
             },
         }];
+        let trust = vec![SessionMcpTrustSnapshot {
+            server_id: snapshot[0].id.clone(),
+            server_fingerprint: session_mcp_server_fingerprint(&snapshot[0]),
+            resolver_profile: SESSION_MCP_RESOLVER_PROFILE_V1.into(),
+        }];
 
-        merge_session_snapshot_mcp_servers(&mut servers, &snapshot, "conv-override", test_broadcaster()).await;
+        merge_session_snapshot_mcp_servers(&mut servers, &snapshot, &trust, "conv-override", test_broadcaster()).await;
 
         let server = servers.get("demo-mcp").expect("snapshot should remain");
         assert_eq!(server.transport, TransportType::Stdio);
+        assert_eq!(server.trust, McpServerTrust::HostAuthenticated);
         let command = server.command.as_deref().expect("stdio command should exist");
         assert_eq!(command, snapshot_command);
         assert_eq!(server.args.as_deref(), Some(&["new-server".to_owned()][..]));
@@ -1942,6 +1992,75 @@ mod tests {
             server.env.as_ref().and_then(|env| env.get("TOKEN")),
             Some(&"abc".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn session_snapshot_remains_untrusted_without_exact_backend_snapshot() {
+        let command = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned();
+        let snapshot = vec![SessionMcpServer {
+            id: "caller-controlled-id".into(),
+            name: "caller-controlled-name".into(),
+            transport: SessionMcpTransport::Stdio {
+                command,
+                args: Vec::new(),
+                env: HashMap::new(),
+            },
+        }];
+        let mut servers = HashMap::new();
+
+        merge_session_snapshot_mcp_servers(&mut servers, &snapshot, &[], "conv-untrusted", test_broadcaster()).await;
+
+        assert_eq!(servers["caller-controlled-name"].trust, McpServerTrust::Untrusted);
+    }
+
+    #[test]
+    fn exact_session_mcp_trust_requires_unique_current_id_and_fingerprint() {
+        let server = SessionMcpServer {
+            id: "trusted-server".into(),
+            name: "studio".into(),
+            transport: SessionMcpTransport::Http {
+                url: "http://127.0.0.1/studio".into(),
+                headers: HashMap::from([("authorization".into(), "Bearer scoped".into())]),
+            },
+        };
+        let exact = SessionMcpTrustSnapshot {
+            server_id: server.id.clone(),
+            server_fingerprint: session_mcp_server_fingerprint(&server),
+            resolver_profile: SESSION_MCP_RESOLVER_PROFILE_V1.into(),
+        };
+        assert!(has_exact_session_mcp_trust(
+            &server,
+            std::slice::from_ref(&server),
+            std::slice::from_ref(&exact)
+        ));
+
+        let mut mismatch = exact.clone();
+        mismatch.server_fingerprint = "0".repeat(64);
+        assert!(!has_exact_session_mcp_trust(
+            &server,
+            std::slice::from_ref(&server),
+            &[mismatch]
+        ));
+        let mut unknown_profile = exact.clone();
+        unknown_profile.resolver_profile = "aioncore.session-mcp-resolver.v999".into();
+        assert!(!has_exact_session_mcp_trust(
+            &server,
+            std::slice::from_ref(&server),
+            &[unknown_profile]
+        ));
+        assert!(!has_exact_session_mcp_trust(
+            &server,
+            &[server.clone(), server.clone()],
+            std::slice::from_ref(&exact)
+        ));
+        assert!(!has_exact_session_mcp_trust(
+            &server,
+            std::slice::from_ref(&server),
+            &[exact.clone(), exact]
+        ));
     }
 
     #[test]
